@@ -1,12 +1,11 @@
 {
   "threshold": 3,
-  "reporters": [
-    "consoleFull"
-  ],
+  "reporters": ["consoleFull"],
   "ignore": [
     "**/__snapshots__/**",
     "**/node_modules/**",
-    "**/*_test.go"
+    "**/*_test.go",
+    "**/.github/workflows/**"
   ],
   "absolute": true
 }

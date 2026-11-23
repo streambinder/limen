@@ -1,1 +1,8 @@
 line-length = 100
+
+# patch_identity and patch_subscribe are sibling scripts imported by
+# their tests, not part of a package: classify both as third-party for
+# import sorting, the same classification isort applies, keeping both
+# sorters in agreement.
+[lint.isort]
+known-third-party = ["patch_identity", "patch_subscribe"]
