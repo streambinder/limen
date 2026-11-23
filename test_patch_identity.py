@@ -143,7 +143,9 @@ def test_local_identity_returns_name(patched_service):
         result={
             "ok": True,
             "status": 200,
-            "response": {"name": "Tiro", "tagline": "Sharp, calm, precise and concise."},
+            "response": {
+                "result": {"name": "Tiro", "tagline": "Sharp, calm, precise and concise."},
+            },
         }
     )
     service = _service_with(patched_service, session)
@@ -152,6 +154,14 @@ def test_local_identity_returns_name(patched_service):
         "ok": True,
         "identity": {"name": "Tiro", "tagline": "Sharp, calm, precise and concise."},
     }
+    assert session.calls == [("GET", "/identity")]
+
+
+def test_local_identity_accepts_bare_body(patched_service):
+    session = _FakeSession(result={"ok": True, "status": 200, "response": {"name": "Tiro"}})
+    service = _service_with(patched_service, session)
+    reply = asyncio.run(service._local_identity())
+    assert reply == {"ok": True, "identity": {"name": "Tiro"}}
     assert session.calls == [("GET", "/identity")]
 
 
@@ -199,7 +209,9 @@ class _FakeWriter:
 
 
 def test_handle_local_routes_identity_op(patched_service):
-    session = _FakeSession(result={"ok": True, "status": 200, "response": {"name": "Tiro"}})
+    session = _FakeSession(
+        result={"ok": True, "status": 200, "response": {"result": {"name": "Tiro"}}}
+    )
     service = _service_with(patched_service, session)
 
     async def _run():

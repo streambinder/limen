@@ -11,9 +11,11 @@ operation to service.py only:
 
 * A socket request with "op": "identity" asks the current session
   for GET /identity (LinkSession.request) and returns
-  {"ok": true, "identity": {...}}. When the service is not connected
-  yet, or the request fails, it answers {"ok": false, "error": ...}
-  like every other local request failure.
+  {"ok": true, "identity": {...}}. The gateway wraps the body in a
+  "result" envelope, unwrapped here; a bare body is accepted too.
+  When the service is not connected yet, or the request fails, it
+  answers {"ok": false, "error": ...} like every other local
+  request failure.
 
 It applies after patch_subscribe.py in the image build, so the
 first needle matches the _handle_local text that patch leaves
@@ -70,6 +72,10 @@ SERVICE_PATCHES = [
             return {"ok": False,
                     "error": f"identity request failed (status {result.get('status')})"}
         identity = result.get("response")
+        # The gateway wraps the body in a "result" envelope (muse-cli's
+        # call_json unwraps it the same way); accept the bare body too.
+        if isinstance(identity, dict):
+            identity = identity.get("result", identity)
         if not isinstance(identity, dict):
             return {"ok": False, "error": "identity is not an object"}
         return {"ok": True, "identity": identity}
