@@ -107,45 +107,11 @@ jobs:
             (cd "$dir" && uv run pytest)
             echo "::endgroup::"
           done < <(find . -name pyproject.toml -not -path '*/.venv/*' -print0)
-  docker-discover:
-    runs-on: ubuntu-24.04-arm
-    permissions:
-      contents: read
-    outputs:
-      matrix: ${{ steps.find.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - id: find
-        name: Find Dockerfiles
-        run: |
-          set -euo pipefail
-          matrix=$(find . -path ./.git -prune -o -type f \( -name Dockerfile -o -name Containerfile \) -print0 \
-            | sort -z \
-            | while IFS= read -r -d '' file; do
-                dir="${file%/*}"
-                name="${dir##*/}"
-                # a Dockerfile at the repo root has no directory name; fall
-                # back to the repository name so the image keeps its name
-                if [ "$dir" = "." ]; then
-                  name="${GITHUB_REPOSITORY##*/}"
-                fi
-                jq -cn --arg name "$name" --arg context "$dir" --arg file "$file" \
-                  '{name: $name, context: $context, file: $file}'
-              done | jq -sc '{include: .}')
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
   docker:
-    needs: docker-discover
-    if: needs.docker-discover.outputs.matrix != '{"include":[]}'
-    name: docker (${{ matrix.name }})
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.docker-discover.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -159,14 +125,46 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.file }}
+          context: .
+          file: docker/Dockerfile
           platforms: linux/arm64
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:latest
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:${{ github.sha }}
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+  notify:
+    needs: [super-linter, mypy, pytest]
+    if: >-
+      success() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    environment:
+      name: prod
+      deployment: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      # workaround: dorny/paths-filter#240 — force pushes break paths-filter
+      - id: parent
+        run: echo "sha=$(git rev-parse HEAD~1)" >> "$GITHUB_OUTPUT"
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d
+        id: filter
+        with:
+          base: ${{ steps.parent.outputs.sha }}
+          filters: |
+            docs:
+              - 'docs/**'
+      - uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697
+        if: steps.filter.outputs.docs == 'true'
+        with:
+          token: ${{ secrets.REPOSITORY_DISPATCH_STREAMBINDER }}
+          repository: streambinder/streambinder
+          event-type: doc-sync
+          client-payload: '{"repo": "${{ github.repository }}", "ref": "${{ github.ref }}", "sha": "${{ github.sha }}"}'

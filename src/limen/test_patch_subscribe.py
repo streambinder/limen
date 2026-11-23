@@ -16,8 +16,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-import patch_subscribe
 import pytest
+
+from limen import patch_subscribe
 
 LIMEN = Path(__file__).resolve().parent
 

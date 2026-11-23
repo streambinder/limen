@@ -19,8 +19,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-import patch_identity
 import pytest
+
+from limen import patch_identity
 
 LIMEN = Path(__file__).resolve().parent
 

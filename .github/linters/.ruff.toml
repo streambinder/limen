@@ -1,8 +1,8 @@
 line-length = 100
 
-# patch_identity and patch_subscribe are sibling scripts imported by
-# their tests, not part of a package: classify both as third-party for
-# import sorting, the same classification isort applies, keeping both
-# sorters in agreement.
+# limen is the local first-party package: the tests import it as
+# limen.patch_identity and limen.patch_subscribe. Classifying it
+# here keeps ruff in agreement with the standalone isort, which
+# reads the same classification from [tool.isort] in pyproject.toml.
 [lint.isort]
-known-third-party = ["patch_identity", "patch_subscribe"]
+known-first-party = ["limen"]
