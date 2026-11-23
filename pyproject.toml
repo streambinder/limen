@@ -20,7 +20,7 @@ force-include = { "shim.py" = "limen/shim.py" }
 
 [tool.mypy]
 strict = true
-files = ["shim.py", "patch_subscribe.py", "patch_network.py"]
+files = ["shim.py", "patch_subscribe.py", "patch_network.py", "patch_identity.py"]
 
 [tool.pytest.ini_options]
 addopts = "--cov --cov-fail-under=90 --cov-report=term-missing"
