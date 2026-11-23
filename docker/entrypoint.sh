@@ -21,7 +21,7 @@ pair)
 	;;
 run)
 	# Shim in background; the gadget service is the main process.
-	python3 /opt/shim/shim.py &
+	/usr/local/bin/limen-shim &
 	exec musegadget run --run-as "${MUSEGADGET_RUN_AS:-gadget}"
 	;;
 info)
