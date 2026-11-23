@@ -1,33 +1,20 @@
 """Unit tests for the limen OpenAI shim.
 
-The shim module is loaded from its file path, the same way the
-existing streaming tests loaded it. HTTP handler tests run a real
-server on an ephemeral loopback port; the Muse socket is a real
-Unix socket served by a test thread.
+The shim module is imported from the limen package. HTTP handler
+tests run a real server on an ephemeral loopback port; the Muse
+socket is a real Unix socket served by a test thread.
 """
 
 import http.client
-import importlib.util
 import json
 import os
 import socket
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
-LIMEN = Path(__file__).resolve().parent
-
-
-def load_shim():
-    spec = importlib.util.spec_from_file_location("limen_shim", LIMEN / "shim.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-shim = load_shim()
+from limen import shim
 
 
 @pytest.fixture(autouse=True)

@@ -46,12 +46,12 @@ RUN useradd --create-home --uid 10001 gadget \
 
 # Patch: allow reporting a fixed SSID via MUSEGADGET_REPORT_SSID
 # (wired-only hosts have no real SSID; upstream issue 79).
-COPY patch_network.py /tmp/patch_network.py
+COPY src/limen/patch_network.py /tmp/patch_network.py
 RUN python3 /tmp/patch_network.py && rm /tmp/patch_network.py
 
 # Patch: stream replies over POST /chat/subscribe on the local socket
 # (the SDK speaks the subscription itself; its socket stays one-shot).
-COPY patch_subscribe.py /tmp/patch_subscribe.py
+COPY src/limen/patch_subscribe.py /tmp/patch_subscribe.py
 RUN python3 /tmp/patch_subscribe.py \
     && grep -n '_local_stream_request\|subscribe_chat' \
         /opt/musegadget/venv/lib/python3.11/site-packages/musegadget/service.py \
@@ -59,14 +59,14 @@ RUN python3 /tmp/patch_subscribe.py \
 
 # Patch: answer {"op": "identity"} on the local socket with the
 # attached Muse's identity, so the shim learns its model name.
-COPY patch_identity.py /tmp/patch_identity.py
+COPY src/limen/patch_identity.py /tmp/patch_identity.py
 RUN python3 /tmp/patch_identity.py \
     && grep -n '_local_identity' \
         /opt/musegadget/venv/lib/python3.11/site-packages/musegadget/service.py \
     && rm /tmp/patch_identity.py
 
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY shim.py /opt/shim/shim.py
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY src/limen/shim.py /opt/shim/shim.py
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENV MUSEGADGET_RUN_AS=gadget \

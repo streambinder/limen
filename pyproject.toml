@@ -6,7 +6,6 @@ build-backend = "hatchling.build"
 name = "limen"
 version = "0.1.0"
 description = "Container image for the Muse Gadget Linux device service"
-readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "GPL-3.0-or-later" }
 dependencies = []
@@ -14,19 +13,20 @@ dependencies = []
 [dependency-groups]
 dev = ["mypy", "pytest", "pytest-cov", "ruff"]
 
-[tool.hatch.build.targets.wheel]
-packages = []
-force-include = { "shim.py" = "limen/shim.py" }
+[tool.isort]
+known_first_party = ["limen"]
+line_length = 100
 
 [tool.mypy]
 strict = true
-files = ["shim.py", "patch_subscribe.py", "patch_network.py", "patch_identity.py"]
+files = ["src/limen/shim.py", "src/limen/patch_subscribe.py", "src/limen/patch_network.py", "src/limen/patch_identity.py"]
 
 [tool.pytest.ini_options]
+testpaths = ["src/limen"]
 addopts = "--cov --cov-fail-under=90 --cov-report=term-missing"
 
 [tool.coverage.run]
-source = ["."]
+source = ["src/limen"]
 omit = ["test_*.py", "patch_network.py"]
 
 [tool.coverage.report]
