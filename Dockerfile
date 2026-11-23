@@ -1,6 +1,6 @@
 # Limen: the Muse Gadget (Linux Device SDK) service from
 # facebookincubator/muse-gadget-sdk, packaged as a container image.
-# Built and published to GHCR by the unciae push workflow; hosts
+# Built and published to GHCR by the limen push workflow; hosts
 # consume the published image and never build it locally.
 # In run mode the entrypoint also starts shim.py, an OpenAI-compatible
 # API on port 8001 in front of the gadget socket.

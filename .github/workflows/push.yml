@@ -1,0 +1,170 @@
+---
+name: push
+
+on: # yamllint disable-line rule:truthy
+  workflow_dispatch: null
+  push:
+    branches: ["**"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  attestations: none
+  checks: none
+  contents: read
+  deployments: none
+  id-token: none
+  issues: none
+  discussions: none
+  packages: read
+  pages: none
+  pull-requests: read
+  repository-projects: none
+  security-events: none
+  statuses: none
+
+jobs:
+  super-linter:
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: mv -vf .github/linters/biome.json .github/linters/commitlint.config.js ./
+      - uses: super-linter/super-linter/slim@2da136927bd4a73596db63044b504547c62cb854
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATE_ALL_CODEBASE: ${{ !contains(github.event_name, 'pull_request') }}
+          VALIDATE_PYTHON_PYINK: false
+          VALIDATE_PYTHON_BLACK: false
+          VALIDATE_PYTHON_PYLINT: false
+          # PYTHON_MYPY deferred until phase-2 of the §21.7 migration; super-linter
+          # invokes mypy per-file which can't reconcile sibling main.py files
+          # under hyphenated tool dirs as separate modules.
+          VALIDATE_PYTHON_MYPY: false
+          VALIDATE_GO: false
+          # Biome already lints TypeScript here, and super-linter itself warns the
+          # two conflict. ESLint additionally resolves imports, which fails on the
+          # pi extensions: their imports come from pi's own runtime, so there is no
+          # package.json to resolve them against and never will be.
+          VALIDATE_TYPESCRIPT_ES: false
+          # IGNORE_GITIGNORED_FILES dropped: super-linter 8.7.0 appends an
+          # unsupported --gitignore flag to the jscpd/cpd binary when it's set,
+          # crashing JSCPD. Removing it keeps copy-paste detection working.
+          SAVE_SUPER_LINTER_OUTPUT: false
+          MULTI_STATUS: false
+          LOG_LEVEL: WARN
+  mypy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: 0.11.12
+      - name: Run mypy --strict per Python project
+        run: |
+          set -euo pipefail
+          # discover every project except the .venv-shadowed roots; each pyproject
+          # owns its mypy scope via [tool.mypy] files = [...] so sibling main.py
+          # files in adjacent projects don't collide as duplicate modules
+          while IFS= read -r -d '' proj; do
+            dir="$(dirname "$proj")"
+            echo "::group::$dir"
+            # --frozen installs the lock without checking it matches pyproject
+            uv lock --check --project "$dir"
+            uv sync --frozen --project "$dir"
+            (cd "$dir" && uv run mypy --strict)
+            echo "::endgroup::"
+          done < <(find . -name pyproject.toml -not -path '*/.venv/*' -print0)
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: 0.11.12
+      - name: Run pytest with coverage per Python project
+        run: |
+          set -euo pipefail
+          # same discovery as the mypy job; each pyproject owns its gate via
+          # [tool.pytest.ini_options] addopts with --cov-fail-under=90 and
+          # [tool.coverage.run] source limited to the project sources
+          while IFS= read -r -d '' proj; do
+            dir="$(dirname "$proj")"
+            echo "::group::$dir"
+            uv lock --check --project "$dir"
+            uv sync --frozen --project "$dir"
+            (cd "$dir" && uv run pytest)
+            echo "::endgroup::"
+          done < <(find . -name pyproject.toml -not -path '*/.venv/*' -print0)
+  docker-discover:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - id: find
+        name: Find Dockerfiles
+        run: |
+          set -euo pipefail
+          matrix=$(find . -path ./.git -prune -o -type f \( -name Dockerfile -o -name Containerfile \) -print0 \
+            | sort -z \
+            | while IFS= read -r -d '' file; do
+                dir="${file%/*}"
+                name="${dir##*/}"
+                # a Dockerfile at the repo root has no directory name; fall
+                # back to the repository name so the image keeps its name
+                if [ "$dir" = "." ]; then
+                  name="${GITHUB_REPOSITORY##*/}"
+                fi
+                jq -cn --arg name "$name" --arg context "$dir" --arg file "$file" \
+                  '{name: $name, context: $context, file: $file}'
+              done | jq -sc '{include: .}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+  docker:
+    needs: docker-discover
+    if: needs.docker-discover.outputs.matrix != '{"include":[]}'
+    name: docker (${{ matrix.name }})
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.docker-discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/arm64
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:latest
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
