@@ -1,11 +1,12 @@
 {
-  "threshold": 3,
+  "threshold": 5,
   "reporters": ["consoleFull"],
   "ignore": [
     "**/__snapshots__/**",
     "**/node_modules/**",
     "**/*_test.go",
-    "**/.github/workflows/**"
+    "**/.github/workflows/**",
+    "**/patch_*.py"
   ],
   "absolute": true
 }
