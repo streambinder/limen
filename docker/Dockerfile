@@ -4,13 +4,21 @@
 # consume the published image and never build it locally.
 # The image carries org.opencontainers.image.source, set by the
 # workflow from the repository URL, so the package links back here.
-# In run mode the entrypoint also starts shim.py, an OpenAI-compatible
-# API on port 8001 in front of the gadget socket.
+# In run mode the entrypoint also starts limen-shim, the Rust
+# OpenAI-compatible API on port 8001 in front of the gadget socket.
 # The service must run as root inside the container: it owns the command
 # socket and drops to the unprivileged gadget account per command via
 # --run-as, like the upstream installer (trivy DS-0002, waived in
 # /.trivyignore).
 # checkov:skip=CKV_DOCKER_3: Must run as root; privileges are dropped to the gadget account per command via --run-as.
+
+# Build stage: compile the Rust shim (native on the arm64 builder).
+FROM docker.io/library/rust:1-bookworm AS rust-shim
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/shim ./crates/shim
+RUN cargo build --release --locked
+
 FROM docker.io/library/debian:bookworm-slim
 
 # Pinned upstream commit of facebookincubator/muse-gadget-sdk.
@@ -66,7 +74,7 @@ RUN python3 /tmp/patch_identity.py \
     && rm /tmp/patch_identity.py
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY src/limen/shim.py /opt/shim/shim.py
+COPY --from=rust-shim /build/target/release/limen-shim /usr/local/bin/limen-shim
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENV MUSEGADGET_RUN_AS=gadget \

@@ -19,7 +19,7 @@ line_length = 100
 
 [tool.mypy]
 strict = true
-files = ["src/limen/shim.py", "src/limen/patch_subscribe.py", "src/limen/patch_network.py", "src/limen/patch_identity.py"]
+files = ["src/limen/patch_subscribe.py", "src/limen/patch_network.py", "src/limen/patch_identity.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["src/limen"]
