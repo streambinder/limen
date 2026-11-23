@@ -2,6 +2,8 @@
 # facebookincubator/muse-gadget-sdk, packaged as a container image.
 # Built and published to GHCR by the limen push workflow; hosts
 # consume the published image and never build it locally.
+# The image carries org.opencontainers.image.source, set by the
+# workflow from the repository URL, so the package links back here.
 # In run mode the entrypoint also starts shim.py, an OpenAI-compatible
 # API on port 8001 in front of the gadget socket.
 # The service must run as root inside the container: it owns the command
