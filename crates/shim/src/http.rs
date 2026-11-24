@@ -322,7 +322,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
         }
         json_response(
             StatusCode::OK,
-            &json!({"object": "list", "data": model_list(&self.config.model_aliases)}),
+            &json!({"object": "list", "data": model_list(&self.config.model_aliases, self.config.context_window)}),
         )
     }
 

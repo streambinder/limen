@@ -14,6 +14,9 @@ pub const DEFAULT_DISCOVERY_WAIT_S: u64 = 60;
 pub const DEFAULT_DISCOVERY_POLL: Duration = Duration::from_secs(2);
 pub const DEFAULT_REPLIES_DIR: &str = "/workspace/replies";
 pub const DEFAULT_REPLY_WAIT_S: u64 = 600;
+/// The context window reported per model in `GET /v1/models`.
+/// A configured value, not a measured one: the gadget never reports it.
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
 /// The upstream service never waits longer than this per turn.
 pub const MAX_WAIT_S: u64 = 600;
 pub const DEFAULT_REPLY_POLL: Duration = Duration::from_secs(2);
@@ -24,6 +27,7 @@ pub struct Config {
     pub port: u16,
     pub timeout: Duration,
     pub model_aliases: Vec<String>,
+    pub context_window: u64,
     pub discovery_wait: Duration,
     pub discovery_poll: Duration,
     pub replies_dir: PathBuf,
@@ -39,6 +43,7 @@ impl Default for Config {
             port: DEFAULT_PORT,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_S),
             model_aliases: Vec::new(),
+            context_window: DEFAULT_CONTEXT_WINDOW,
             discovery_wait: Duration::from_secs(DEFAULT_DISCOVERY_WAIT_S),
             discovery_poll: DEFAULT_DISCOVERY_POLL,
             replies_dir: PathBuf::from(DEFAULT_REPLIES_DIR),
@@ -91,6 +96,7 @@ impl Config {
             port: env_u16("SHIM_PORT", DEFAULT_PORT)?,
             timeout: Duration::from_secs(env_u64("SHIM_TIMEOUT_S", DEFAULT_TIMEOUT_S)?),
             model_aliases: env_list("SHIM_MODEL_ALIASES"),
+            context_window: env_u64("SHIM_CONTEXT_WINDOW", DEFAULT_CONTEXT_WINDOW)?,
             discovery_wait: Duration::from_secs(env_u64(
                 "SHIM_DISCOVERY_WAIT_S",
                 DEFAULT_DISCOVERY_WAIT_S,
@@ -153,6 +159,7 @@ mod tests {
         assert_eq!(config.timeout, Duration::from_secs(1800));
         assert_eq!(config.discovery_wait, Duration::from_secs(60));
         assert_eq!(config.reply_wait_s, 600);
+        assert_eq!(config.context_window, 1_000_000);
         assert_eq!(MAX_WAIT_S, 600);
     }
 }

@@ -53,6 +53,7 @@ mode requires `stream: true`.
 ## Models and health
 
 `GET /v1/models` lists the discovered Muse name first, then the configured aliases.
+Each entry also reports `context_window`, from `SHIM_CONTEXT_WINDOW` (default 1000000).
 `GET /healthz` returns 200 when the gadget socket exists
 and 503 when it does not. The health endpoint needs no key.
 
