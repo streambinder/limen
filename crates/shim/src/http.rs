@@ -399,14 +399,16 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
                 &json!({"error": {"message": "no model specified"}}),
             );
         }
-        // The session source is the session_id body field, then the
-        // user body field, then the X-Session-Id header.
-        let session_source: Option<String> = [body.get("session_id"), body.get("user")]
-            .into_iter()
-            .flatten()
-            .find(|v| is_truthy(v))
-            .map(py_str)
-            .or_else(|| session_header.filter(|h| !h.is_empty()));
+        // The session source is the X-Session-Id header, then the
+        // session_id body field, then the user body field.
+        let session_source: Option<String> =
+            session_header.filter(|h| !h.is_empty()).or_else(|| {
+                [body.get("session_id"), body.get("user")]
+                    .into_iter()
+                    .flatten()
+                    .find(|v| is_truthy(v))
+                    .map(py_str)
+            });
         let route = match resolve_model(
             &model,
             session_source.as_deref(),
@@ -1335,6 +1337,27 @@ mod tests {
         assert_eq!(
             *calls,
             vec![("user: hi".to_string(), Some("sess-9".to_string()), Some(30))]
+        );
+    }
+
+    #[tokio::test]
+    async fn post_header_wins_over_body_session_fields() {
+        let gadget = gadget_with_reply(json!({"ok": true, "reply": "text", "response": "r"}));
+        let (status, _, _) = completion_case_with_headers(
+            gadget.clone(),
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "muse", "session_id": "sess-body", "user": "bob"}"#,
+            &[("X-Session-Id", "sess-header")],
+        )
+        .await;
+        assert_eq!(status, 200);
+        let calls = gadget.ask_calls.lock().unwrap();
+        assert_eq!(
+            *calls,
+            vec![(
+                "user: hi".to_string(),
+                Some("sess-header".to_string()),
+                Some(30)
+            )]
         );
     }
 
