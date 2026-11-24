@@ -27,6 +27,10 @@ use crate::json::{is_truthy, py_str, python_dumps};
 use crate::model::{model_list, resolve_model};
 use crate::prompt::{build_prompt, extract_text, json_fallback};
 use crate::replies::{ReplyWait, reply_footer};
+use crate::tools::{
+    ToolCall, ToolDef, parse_tool_calls, parse_tool_choice, parse_tools, tool_appendix,
+    tools_active,
+};
 use crate::translator::StreamTranslator;
 
 /// The response body type: JSON bodies and SSE streams alike.
@@ -96,7 +100,8 @@ fn deny() -> HttpResponse {
 }
 
 /// The non-streaming completion object.
-pub fn completion_object(model: &str, content: &str) -> Value {
+/// A chat completion envelope around one message and finish reason.
+fn completion_envelope(model: &str, message: Value, finish_reason: &str) -> Value {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -108,11 +113,33 @@ pub fn completion_object(model: &str, content: &str) -> Value {
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": content},
-            "finish_reason": "stop",
+            "message": message,
+            "finish_reason": finish_reason,
         }],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     })
+}
+
+pub fn completion_object(model: &str, content: &str) -> Value {
+    completion_envelope(
+        model,
+        json!({"role": "assistant", "content": content}),
+        "stop",
+    )
+}
+
+/// A chat completion whose message carries tool calls instead of
+/// text: content is null, `finish_reason` is `tool_calls`.
+pub fn tool_calls_object(model: &str, calls: &[ToolCall]) -> Value {
+    completion_envelope(
+        model,
+        json!({
+            "role": "assistant",
+            "content": Value::Null,
+            "tool_calls": calls.iter().map(ToolCall::to_openai).collect::<Vec<Value>>(),
+        }),
+        "tool_calls",
+    )
 }
 
 /// The `error` (else the `status`) of a failed turn, for log lines.
@@ -375,12 +402,19 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
                 &json!({"error": {"message": "listen_only requires stream"}}),
             );
         }
-        let prompt = build_prompt(body.get("messages").unwrap_or(&Value::Null));
+        let tools = parse_tools(body);
+        let tool_choice = parse_tool_choice(body);
+        let tools_on = tools_active(&tools, &tool_choice);
+        let mut prompt = build_prompt(body.get("messages").unwrap_or(&Value::Null));
         if prompt.is_empty() && !listen_only {
             return json_response(
                 StatusCode::BAD_REQUEST,
                 &json!({"error": {"message": "no message content"}}),
             );
+        }
+        if tools_on {
+            prompt.push_str("\n\n");
+            prompt.push_str(&tool_appendix(&tools, &tool_choice));
         }
         let model_raw = body
             .get("model")
@@ -445,6 +479,11 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
             if wait { "True" } else { "False" }
         ));
         if is_truthy(body.get("stream").unwrap_or(&Value::Null)) {
+            if tools_on && wait {
+                return self
+                    .stream_tools_once(prompt, session_id, model, &tools, started)
+                    .await;
+            }
             return self
                 .stream_response(StreamRequest {
                     prompt,
@@ -458,26 +497,64 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
                 })
                 .await;
         }
-        let reply = if wait {
-            self.gadget
-                .ask(
+        let content = if wait {
+            match self
+                .ask_turn_content(
                     prompt,
                     session_id,
                     Some(std::cmp::min(self.config.reply_wait_s, MAX_WAIT_S)),
+                    started,
                 )
                 .await
+            {
+                Ok(content) => content,
+                Err(response) => return *response,
+            }
         } else {
-            self.gadget.ask(forwarded, session_id, None).await
+            match self
+                .ask_turn_content(forwarded, session_id, None, started)
+                .await
+            {
+                Ok(content) => content,
+                Err(response) => return *response,
+            }
         };
+        let elapsed = started.elapsed().as_secs_f32();
+        if tools_on && let Some(calls) = parse_tool_calls(&content, &tools) {
+            log(&format!(
+                "chat ok in {elapsed:.1}s tool_calls={}",
+                calls.len()
+            ));
+            return json_response(StatusCode::OK, &tool_calls_object(&model, &calls));
+        }
+        log(&format!(
+            "chat ok in {elapsed:.1}s response_chars={}",
+            content.chars().count()
+        ));
+        json_response(StatusCode::OK, &completion_object(&model, &content))
+    }
+
+    /// One gadget turn and its reply text: the wait path when
+    /// `wait_s` is set, the plain ask otherwise. Errors become the
+    /// 502 response the non-streaming handler returns (boxed: the
+    /// response is large for a `Result` error variant).
+    async fn ask_turn_content(
+        &self,
+        prompt: String,
+        session_id: Option<String>,
+        wait_s: Option<u64>,
+        started: Instant,
+    ) -> Result<String, Box<HttpResponse>> {
+        let reply = self.gadget.ask(prompt, session_id, wait_s).await;
         let elapsed = started.elapsed().as_secs_f32();
         let reply = match reply {
             Ok(reply) => reply,
             Err(e) => {
                 log(&format!("chat failed after {elapsed:.1}s: {e}"));
-                return json_response(
+                return Err(Box::new(json_response(
                     StatusCode::BAD_GATEWAY,
                     &json!({"error": {"message": format!("musegadget unreachable: {e}")}}),
-                );
+                )));
             }
         };
         if !is_truthy(reply.get("ok").unwrap_or(&Value::Null)) {
@@ -485,12 +562,12 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
                 "chat not ok after {elapsed:.1}s: {}",
                 error_or_status(&reply)
             ));
-            return json_response(
+            return Err(Box::new(json_response(
                 StatusCode::BAD_GATEWAY,
                 &json!({"error": {"message": format!("Muse turn failed: {}", error_or_reply(&reply))}}),
-            );
+            )));
         }
-        let mut content = if wait {
+        let mut content = if wait_s.is_some() {
             wait_reply_text(&reply, elapsed)
         } else {
             String::new()
@@ -501,11 +578,76 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
         if content.is_empty() {
             content = json_fallback(reply.get("response").unwrap_or(&Value::Null));
         }
-        log(&format!(
-            "chat ok in {elapsed:.1}s response_chars={}",
-            content.chars().count()
-        ));
-        json_response(StatusCode::OK, &completion_object(&model, &content))
+        Ok(content)
+    }
+
+    /// A streaming request with tools, answered as one buffered SSE
+    /// chunk: the reply is parsed for tool calls (or text) after the
+    /// wait path returns, then emitted as a single event plus
+    /// [DONE]. Live deltas would leak the tool_calls JSON as text,
+    /// so a tool turn never streams incrementally.
+    async fn stream_tools_once(
+        &self,
+        prompt: String,
+        session_id: Option<String>,
+        model: String,
+        tools: &[ToolDef],
+        started: Instant,
+    ) -> HttpResponse {
+        let content = match self
+            .ask_turn_content(
+                prompt,
+                session_id,
+                Some(std::cmp::min(self.config.reply_wait_s, MAX_WAIT_S)),
+                started,
+            )
+            .await
+        {
+            Ok(content) => content,
+            Err(response) => return *response,
+        };
+        let elapsed = started.elapsed().as_secs_f32();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let (delta, finish) = match parse_tool_calls(&content, tools) {
+            Some(calls) => {
+                log(&format!(
+                    "stream tool_calls={} in {elapsed:.1}s",
+                    calls.len()
+                ));
+                (
+                    json!({
+                        "role": "assistant",
+                        "content": Value::Null,
+                        "tool_calls": calls.iter().map(ToolCall::to_openai).collect::<Vec<Value>>(),
+                    }),
+                    "tool_calls",
+                )
+            }
+            None => (json!({"role": "assistant", "content": content}), "stop"),
+        };
+        let chunk = json!({
+            "id": format!("chatcmpl-gadget-{now}"),
+            "object": "chat.completion.chunk",
+            "created": now,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish,
+            }],
+        });
+        let body = format!("data: {}\n\ndata: [DONE]\n\n", python_dumps(&chunk));
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header("X-Accel-Buffering", "no")
+            .header(header::CONNECTION, "close")
+            .body(Full::new(Bytes::from(body)).boxed())
+            .unwrap()
     }
 
     /// Start the streaming flow in the background and answer from its
@@ -1297,6 +1439,129 @@ mod tests {
             json_body(&raw)["choices"][0]["message"]["content"],
             "partial text"
         );
+    }
+
+    const TOOLS_BODY: &str = r#"{"messages": [{"role": "user", "content": "what is 17 times 23?"}], "model": "muse",
+        "tools": [{"type": "function", "function": {"name": "multiply", "description": "Multiply two numbers",
+        "parameters": {"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}}}}]}"#;
+
+    #[tokio::test]
+    async fn post_tools_returns_tool_calls() {
+        let gadget = gadget_with_reply(json!({
+            "ok": true,
+            "reply": r#"{"tool_calls": [{"name": "multiply", "arguments": {"a": 17, "b": 23}}]}"#,
+            "response": "receipt",
+        }));
+        let (status, _, raw) = completion_case(gadget.clone(), TOOLS_BODY).await;
+        assert_eq!(status, 200);
+        let body = json_body(&raw);
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert!(body["choices"][0]["message"]["content"].is_null());
+        let calls = body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("call_"))
+        );
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "multiply");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"a\": 17, \"b\": 23}");
+        let prompt = gadget.ask_calls.lock().unwrap()[0].0.clone();
+        assert!(prompt.contains("You have these tools available"));
+        assert!(prompt.contains("multiply"));
+    }
+
+    #[tokio::test]
+    async fn post_tools_returns_text_when_no_call() {
+        let gadget = gadget_with_reply(json!({
+            "ok": true,
+            "reply": "391",
+            "response": "receipt",
+        }));
+        let (status, _, raw) = completion_case(gadget, TOOLS_BODY).await;
+        assert_eq!(status, 200);
+        let body = json_body(&raw);
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["choices"][0]["message"]["content"], "391");
+        assert!(body["choices"][0]["message"]["tool_calls"].is_null());
+    }
+
+    #[tokio::test]
+    async fn post_tools_choice_none_skips_appendix() {
+        let gadget = gadget_with_reply(json!({
+            "ok": true,
+            "reply": "391",
+            "response": "receipt",
+        }));
+        let (status, _, raw) = completion_case(
+            gadget.clone(),
+            r#"{"messages": [{"role": "user", "content": "what is 17 times 23?"}], "model": "muse",
+                "tool_choice": "none",
+                "tools": [{"type": "function", "function": {"name": "multiply", "description": "Multiply"}}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(json_body(&raw)["choices"][0]["message"]["content"], "391");
+        let prompt = gadget.ask_calls.lock().unwrap()[0].0.clone();
+        assert!(!prompt.contains("You have these tools available"));
+    }
+
+    #[tokio::test]
+    async fn post_tool_history_renders_in_prompt() {
+        let gadget = gadget_with_reply(json!({
+            "ok": true,
+            "reply": "The product is 391.",
+            "response": "receipt",
+        }));
+        let (status, _, _) = completion_case(
+            gadget.clone(),
+            r#"{"messages": [
+                {"role": "user", "content": "what is 17 times 23?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "multiply", "arguments": "{\"a\": 17, \"b\": 23}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "391"},
+                {"role": "user", "content": "thanks"}
+            ], "model": "muse",
+            "tools": [{"type": "function", "function": {"name": "multiply", "description": "Multiply"}}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let prompt = gadget.ask_calls.lock().unwrap()[0].0.clone();
+        assert!(prompt.contains("[called tool `multiply` with arguments"));
+        assert!(prompt.contains("tool multiply: 391"));
+    }
+
+    #[tokio::test]
+    async fn post_stream_tools_single_chunk() {
+        let gadget = gadget_with_reply(json!({
+            "ok": true,
+            "reply": r#"{"tool_calls": [{"name": "multiply", "arguments": {"a": 17, "b": 23}}]}"#,
+            "response": "receipt",
+        }));
+        let (status, content_type, raw) = post(
+            serve_with(
+                config_open(),
+                gadget,
+                Arc::new(FakeReplyWait::new()),
+            )
+            .await
+            .port,
+            r#"{"messages": [{"role": "user", "content": "what is 17 times 23?"}], "model": "muse", "stream": true,
+                "tools": [{"type": "function", "function": {"name": "multiply", "description": "Multiply"}}]}"#,
+            &[],
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(content_type.as_deref(), Some("text/event-stream"));
+        let body = String::from_utf8(raw).unwrap();
+        assert!(body.contains("\"tool_calls\""));
+        assert!(body.contains("\"finish_reason\": \"tool_calls\""));
+        assert!(body.ends_with("data: [DONE]\n\n"));
     }
 
     #[tokio::test]
