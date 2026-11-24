@@ -6,6 +6,7 @@ pub mod model;
 pub mod prompt;
 pub mod replies;
 pub mod server;
+pub mod tools;
 pub mod translator;
 
 #[cfg(test)]

@@ -57,6 +57,26 @@ Each entry also reports `context_window`, from `SHIM_CONTEXT_WINDOW` (default 10
 `GET /healthz` returns 200 when the gadget socket exists
 and 503 when it does not. The health endpoint needs no key.
 
+## Tool calling
+
+The gadget channel carries text turns only, so the Muse cannot
+emit native tool calls. The shim implements OpenAI function
+calling by prompt injection: it appends the `tools` schemas to
+the prompt and asks the Muse to answer with a
+`{"tool_calls": [...]}` JSON object when it wants a tool. A reply
+in that shape becomes a real OpenAI response with `tool_calls`
+and `finish_reason: tool_calls`; any other reply comes back as
+plain text. Tools execute on the client, never in the shim.
+
+Follow-up turns carry the tool history as text: an assistant
+message with `tool_calls` and a `tool` message with its result
+render as prompt lines, with the result labelled by its tool
+name. `tool_choice: "none"` skips the injection; a
+`{"type": "function", "function": {"name": ...}}` choice requires
+that tool. A streaming request with tools is answered as one
+buffered SSE chunk plus `[DONE]`, never as live deltas: the
+tool_calls JSON would otherwise leak out as text first.
+
 ## Model addressing
 
 The model in a completion request names a Muse and, optionally, a
