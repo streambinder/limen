@@ -1090,13 +1090,13 @@ mod tests {
             .iter()
             .map(|m| m["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, ["tiro"]);
+        assert_eq!(ids, ["muse"]);
     }
 
     #[tokio::test]
     async fn get_models_lists_configured_aliases() {
         let config = Config {
-            model_aliases: vec!["tiro".to_string(), "other".to_string()],
+            model_aliases: vec!["muse".to_string(), "other".to_string()],
             ..config_open()
         };
         let gadget = Arc::new(FakeGadget::new());
@@ -1110,7 +1110,7 @@ mod tests {
             .iter()
             .map(|m| m["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, ["tiro", "other"]);
+        assert_eq!(ids, ["muse", "other"]);
     }
 
     #[tokio::test]
@@ -1236,13 +1236,13 @@ mod tests {
         .await;
         let (status, _, raw) = post(
             server.port,
-            r#"{"messages": [{"role": "user", "content": "hi"}], "wait_reply": false, "model": "tiro"}"#,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "wait_reply": false, "model": "muse"}"#,
             &[("X-Session-Id", "My Session!")],
         )
         .await;
         assert_eq!(status, 200);
         let body = json_body(&raw);
-        assert_eq!(body["model"], "tiro");
+        assert_eq!(body["model"], "muse");
         assert_eq!(body["choices"][0]["message"]["content"], "plain answer");
         let calls = gadget.ask_calls.lock().unwrap();
         assert_eq!(
@@ -1261,7 +1261,7 @@ mod tests {
         let (status, _, raw) = completion_case_with_replies(
             gadget.clone(),
             replies,
-            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "tiro", "user": "bob"}"#,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "muse", "user": "bob"}"#,
         )
         .await;
         assert_eq!(status, 200);
@@ -1287,7 +1287,7 @@ mod tests {
         }));
         let (status, _, raw) = completion_case(
             gadget,
-            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "tiro"}"#,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "muse"}"#,
         )
         .await;
         assert_eq!(status, 200);
@@ -1309,7 +1309,7 @@ mod tests {
         let server = serve_with(config_open(), gadget, replies).await;
         let (status, _, raw) = post(
             server.port,
-            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "tiro"}"#,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "muse"}"#,
             &[],
         )
         .await;
@@ -1321,16 +1321,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_model_tiro_with_header_keeps_header_session() {
+    async fn post_model_muse_with_header_keeps_header_session() {
         let gadget = gadget_with_reply(json!({"ok": true, "reply": "text", "response": "r"}));
         let (status, _, raw) = completion_case_with_headers(
             gadget.clone(),
-            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "tiro"}"#,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "muse"}"#,
             &[("X-Session-Id", "sess-9")],
         )
         .await;
         assert_eq!(status, 200);
-        assert_eq!(json_body(&raw)["model"], "tiro");
+        assert_eq!(json_body(&raw)["model"], "muse");
         let calls = gadget.ask_calls.lock().unwrap();
         assert_eq!(
             *calls,
@@ -1349,7 +1349,7 @@ mod tests {
         .await;
         let (status, _, _) = post(
             server.port,
-            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "tiro/12345678-1234-1234-1234-1234567890ab"}"#,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "muse/12345678-1234-1234-1234-1234567890ab"}"#,
             &[("X-Session-Id", "sess-9")],
         )
         .await;
@@ -1370,7 +1370,7 @@ mod tests {
         let gadget = gadget_with_reply(json!({"ok": true, "reply": "text", "response": "r"}));
         let (status, _, _) = completion_case(
             gadget.clone(),
-            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "tiro"}"#,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "muse"}"#,
         )
         .await;
         assert_eq!(status, 200);
@@ -1408,7 +1408,7 @@ mod tests {
         let gadget = gadget_with_reply(json!({"ok": true, "reply": "text"}));
         let (status, _, raw) = completion_case(
             gadget.clone(),
-            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "tiro/not-a-uuid"}"#,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "muse/not-a-uuid"}"#,
         )
         .await;
         assert_eq!(status, 400);
@@ -1419,7 +1419,7 @@ mod tests {
     #[tokio::test]
     async fn post_completion_unextractable_response_is_json_dumped() {
         let gadget = gadget_with_reply(json!({"ok": true, "response": null}));
-        let (status, _, raw) = completion_case(gadget, r#"{"messages": [{"role": "user", "content": "hi"}], "model": "tiro", "wait_reply": false}"#).await;
+        let (status, _, raw) = completion_case(gadget, r#"{"messages": [{"role": "user", "content": "hi"}], "model": "muse", "wait_reply": false}"#).await;
         assert_eq!(status, 200);
         assert_eq!(json_body(&raw)["choices"][0]["message"]["content"], "null");
     }
@@ -1429,7 +1429,7 @@ mod tests {
         let gadget = Arc::new(FakeGadget::new().with_ask_replies(vec![Err(io_error("no socket"))]));
         let (status, _, raw) = completion_case(
             gadget,
-            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "tiro"}"#,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "muse"}"#,
         )
         .await;
         assert_eq!(status, 502);
@@ -1441,7 +1441,7 @@ mod tests {
         let gadget = gadget_with_reply(json!({"ok": false, "error": "bad turn"}));
         let (status, _, raw) = completion_case(
             gadget,
-            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "tiro"}"#,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "muse"}"#,
         )
         .await;
         assert_eq!(status, 502);
@@ -1450,7 +1450,7 @@ mod tests {
 
     fn stream_body(extra: &str) -> String {
         format!(
-            r#"{{"messages": [{{"role": "user", "content": "hi"}}], "stream": true, "model": "tiro"{extra}}}"#
+            r#"{{"messages": [{{"role": "user", "content": "hi"}}], "stream": true, "model": "muse"{extra}}}"#
         )
     }
 
@@ -1800,7 +1800,7 @@ mod tests {
         ]));
         let (status, _, raw) = stream_case(
             gadget.clone(),
-            r#", "wait_reply": false, "model": "tiro/12345678-1234-1234-1234-1234567890ab""#,
+            r#", "wait_reply": false, "model": "muse/12345678-1234-1234-1234-1234567890ab""#,
         )
         .await;
         assert_eq!(status, 200);
@@ -1832,7 +1832,7 @@ mod tests {
         let gadget = Arc::new(FakeGadget::new().with_listen_items(vec![Err(io_error("down"))]));
         let (status, _, raw) = completion_case(
             gadget,
-            r#"{"stream": true, "listen_only": true, "model": "tiro", "session_id": "sess-1"}"#,
+            r#"{"stream": true, "listen_only": true, "model": "muse", "session_id": "sess-1"}"#,
         )
         .await;
         assert_eq!(status, 502);
@@ -1846,7 +1846,7 @@ mod tests {
         );
         let (status, _, raw) = completion_case(
             gadget,
-            r#"{"stream": true, "listen_only": true, "model": "tiro", "session_id": "sess-1"}"#,
+            r#"{"stream": true, "listen_only": true, "model": "muse", "session_id": "sess-1"}"#,
         )
         .await;
         assert_eq!(status, 502);
@@ -1867,7 +1867,7 @@ mod tests {
         let server = serve_with(config_open(), gadget, replies).await;
         let (status, _, raw) = post(
             server.port,
-            r#"{"stream": true, "listen_only": true, "model": "tiro", "session_id": "sess-1"}"#,
+            r#"{"stream": true, "listen_only": true, "model": "muse", "session_id": "sess-1"}"#,
             &[],
         )
         .await;
@@ -1890,7 +1890,7 @@ mod tests {
             .await
             .unwrap();
         let body =
-            r#"{"stream": true, "listen_only": true, "model": "tiro", "session_id": "sess-1"}"#;
+            r#"{"stream": true, "listen_only": true, "model": "muse", "session_id": "sess-1"}"#;
         let request = format!(
             "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}",
             body.len()

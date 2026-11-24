@@ -110,7 +110,7 @@ impl Config {
         Config {
             socket_path: "/nonexistent/gadget.sock".to_string(),
             port: 0,
-            model_aliases: vec!["tiro".to_string()],
+            model_aliases: vec!["muse".to_string()],
             discovery_wait: Duration::from_secs(0),
             discovery_poll: Duration::from_millis(0),
             reply_wait_s: 30,

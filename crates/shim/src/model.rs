@@ -66,8 +66,9 @@ fn is_uuid(text: &str) -> bool {
 /// Forms: `<alias>`, `<alias>/main`, `<alias>/<uuid>`. The
 /// conversation in the model wins over the session source; a bare
 /// alias uses the session source, or the main chat when there is
-/// none. Unknown aliases are 404 `model_not_found`; a malformed
-/// conversation is 400 `invalid_model`.
+/// none. Alias matching is case-insensitive and the returned alias
+/// is the configured spelling. Unknown aliases are 404
+/// `model_not_found`; a malformed conversation is 400 `invalid_model`.
 pub fn resolve_model(
     model: &str,
     session_source: Option<&str>,
@@ -78,24 +79,28 @@ pub fn resolve_model(
         Some((name, conversation)) => (name, Some(conversation)),
         None => (trimmed, None),
     };
-    if !aliases.iter().any(|alias| alias == name) {
+    let Some(canonical) = aliases
+        .iter()
+        .find(|alias| alias.eq_ignore_ascii_case(name))
+    else {
         return Err(ModelAddressError {
             message: format!("The model `{model}` does not exist"),
             status: 404,
             code: "model_not_found",
         });
-    }
+    };
+    let alias = canonical.clone();
     match conversation {
         None => Ok(ModelRoute {
-            alias: name.to_string(),
+            alias,
             session_id: session_source.map(sanitize_session_id),
         }),
         Some("main") => Ok(ModelRoute {
-            alias: name.to_string(),
+            alias,
             session_id: None,
         }),
         Some(conversation) if is_uuid(conversation) => Ok(ModelRoute {
-            alias: name.to_string(),
+            alias,
             session_id: Some(conversation.to_ascii_lowercase()),
         }),
         Some(_) => Err(ModelAddressError {
@@ -130,7 +135,7 @@ mod tests {
     use super::*;
 
     fn aliases() -> Vec<String> {
-        vec!["tiro".to_string()]
+        vec!["muse".to_string()]
     }
 
     #[test]
@@ -146,16 +151,49 @@ mod tests {
     #[test]
     fn resolve_bare_alias_uses_session_source() {
         assert_eq!(
-            resolve_model("tiro", Some("sess-9"), &aliases()).unwrap(),
+            resolve_model("muse", Some("sess-9"), &aliases()).unwrap(),
             ModelRoute {
-                alias: "tiro".to_string(),
+                alias: "muse".to_string(),
                 session_id: Some("sess-9".to_string()),
             }
         );
         assert_eq!(
-            resolve_model("tiro", None, &aliases()).unwrap(),
+            resolve_model("muse", None, &aliases()).unwrap(),
             ModelRoute {
-                alias: "tiro".to_string(),
+                alias: "muse".to_string(),
+                session_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_alias_match_is_case_insensitive() {
+        let aliases = vec!["Muse".to_string()];
+        for form in ["muse", "Muse", "MUSE", "mUsE"] {
+            assert_eq!(
+                resolve_model(form, None, &aliases).unwrap(),
+                ModelRoute {
+                    alias: "Muse".to_string(),
+                    session_id: None,
+                },
+                "{form}"
+            );
+        }
+        let route = resolve_model(
+            "muse/12345678-1234-1234-1234-1234567890AB",
+            Some("sess-9"),
+            &aliases,
+        )
+        .unwrap();
+        assert_eq!(route.alias, "Muse");
+        assert_eq!(
+            route.session_id,
+            Some("12345678-1234-1234-1234-1234567890ab".to_string())
+        );
+        assert_eq!(
+            resolve_model("MUSE/main", Some("sess-9"), &aliases).unwrap(),
+            ModelRoute {
+                alias: "Muse".to_string(),
                 session_id: None,
             }
         );
@@ -164,7 +202,7 @@ mod tests {
     #[test]
     fn resolve_slash_uuid_wins_over_header() {
         let route = resolve_model(
-            "tiro/12345678-1234-1234-1234-1234567890AB",
+            "muse/12345678-1234-1234-1234-1234567890AB",
             Some("sess-9"),
             &aliases(),
         )
@@ -172,7 +210,7 @@ mod tests {
         assert_eq!(
             route,
             ModelRoute {
-                alias: "tiro".to_string(),
+                alias: "muse".to_string(),
                 session_id: Some("12345678-1234-1234-1234-1234567890ab".to_string()),
             }
         );
@@ -181,9 +219,9 @@ mod tests {
     #[test]
     fn resolve_slash_main_is_main_even_with_header() {
         assert_eq!(
-            resolve_model("tiro/main", Some("sess-9"), &aliases()).unwrap(),
+            resolve_model("muse/main", Some("sess-9"), &aliases()).unwrap(),
             ModelRoute {
-                alias: "tiro".to_string(),
+                alias: "muse".to_string(),
                 session_id: None,
             }
         );
@@ -200,10 +238,10 @@ mod tests {
     #[test]
     fn resolve_bad_conversation_is_400() {
         for bad in [
-            "tiro/not-a-uuid",
-            "tiro/",
-            "tiro/12345678-1234-1234-1234-1234567890ab/extra",
-            "tiro/12345678",
+            "muse/not-a-uuid",
+            "muse/",
+            "muse/12345678-1234-1234-1234-1234567890ab/extra",
+            "muse/12345678",
         ] {
             let err = resolve_model(bad, None, &aliases()).unwrap_err();
             assert_eq!(err.status, 400, "{bad}");
@@ -214,9 +252,9 @@ mod tests {
     #[test]
     fn resolve_header_is_sanitized() {
         assert_eq!(
-            resolve_model("tiro", Some("My Session!"), &aliases()).unwrap(),
+            resolve_model("muse", Some("My Session!"), &aliases()).unwrap(),
             ModelRoute {
-                alias: "tiro".to_string(),
+                alias: "muse".to_string(),
                 session_id: Some("My-Session".to_string()),
             }
         );
@@ -232,7 +270,7 @@ mod tests {
 
     #[test]
     fn model_list_lists_configured_aliases() {
-        let two = vec!["tiro".to_string(), "other".to_string()];
+        let two = vec!["muse".to_string(), "other".to_string()];
         let list = model_list(&two);
         let ids: Vec<&str> = list
             .as_array()
@@ -240,7 +278,7 @@ mod tests {
             .iter()
             .map(|m| m["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, ["tiro", "other"]);
+        assert_eq!(ids, ["muse", "other"]);
         let one = model_list(&aliases()[..]);
         assert_eq!(one.as_array().unwrap().len(), 1);
     }

@@ -145,7 +145,7 @@ def test_local_identity_returns_name(patched_service):
             "ok": True,
             "status": 200,
             "response": {
-                "result": {"name": "Tiro", "tagline": "Sharp, calm, precise and concise."},
+                "result": {"name": "Muse", "tagline": "A personal assistant."},
             },
         }
     )
@@ -153,16 +153,16 @@ def test_local_identity_returns_name(patched_service):
     reply = asyncio.run(service._local_identity())
     assert reply == {
         "ok": True,
-        "identity": {"name": "Tiro", "tagline": "Sharp, calm, precise and concise."},
+        "identity": {"name": "Muse", "tagline": "A personal assistant."},
     }
     assert session.calls == [("GET", "/identity")]
 
 
 def test_local_identity_accepts_bare_body(patched_service):
-    session = _FakeSession(result={"ok": True, "status": 200, "response": {"name": "Tiro"}})
+    session = _FakeSession(result={"ok": True, "status": 200, "response": {"name": "Muse"}})
     service = _service_with(patched_service, session)
     reply = asyncio.run(service._local_identity())
-    assert reply == {"ok": True, "identity": {"name": "Tiro"}}
+    assert reply == {"ok": True, "identity": {"name": "Muse"}}
     assert session.calls == [("GET", "/identity")]
 
 
@@ -188,7 +188,7 @@ def test_local_identity_reports_gateway_error(patched_service):
 
 
 def test_local_identity_rejects_non_object_response(patched_service):
-    session = _FakeSession(result={"ok": True, "status": 200, "response": "Tiro"})
+    session = _FakeSession(result={"ok": True, "status": 200, "response": "Muse"})
     service = _service_with(patched_service, session)
     reply = asyncio.run(service._local_identity())
     assert reply == {"ok": False, "error": "identity is not an object"}
@@ -211,7 +211,7 @@ class _FakeWriter:
 
 def test_handle_local_routes_identity_op(patched_service):
     session = _FakeSession(
-        result={"ok": True, "status": 200, "response": {"result": {"name": "Tiro"}}}
+        result={"ok": True, "status": 200, "response": {"result": {"name": "Muse"}}}
     )
     service = _service_with(patched_service, session)
 
@@ -227,5 +227,5 @@ def test_handle_local_routes_identity_op(patched_service):
     writer = asyncio.run(_run())
     assert len(writer.written) == 1
     reply = json.loads(writer.written[0])
-    assert reply == {"ok": True, "identity": {"name": "Tiro"}}
+    assert reply == {"ok": True, "identity": {"name": "Muse"}}
     assert session.calls == [("GET", "/identity")]
