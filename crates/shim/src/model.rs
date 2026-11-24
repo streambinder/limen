@@ -114,7 +114,7 @@ pub fn resolve_model(
 }
 
 /// The `/v1/models` entries for the configured aliases.
-pub fn model_list(aliases: &[String]) -> Value {
+pub fn model_list(aliases: &[String], context_window: u64) -> Value {
     Value::Array(
         aliases
             .iter()
@@ -124,6 +124,7 @@ pub fn model_list(aliases: &[String]) -> Value {
                     "object": "model",
                     "created": 0,
                     "owned_by": "musegadget-shim",
+                    "context_window": context_window,
                 })
             })
             .collect(),
@@ -271,7 +272,7 @@ mod tests {
     #[test]
     fn model_list_lists_configured_aliases() {
         let two = vec!["muse".to_string(), "other".to_string()];
-        let list = model_list(&two);
+        let list = model_list(&two, 1_000_000);
         let ids: Vec<&str> = list
             .as_array()
             .unwrap()
@@ -279,7 +280,13 @@ mod tests {
             .map(|m| m["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, ["muse", "other"]);
-        let one = model_list(&aliases()[..]);
+        assert!(
+            list.as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["context_window"].as_u64() == Some(1_000_000))
+        );
+        let one = model_list(&aliases()[..], 1_000_000);
         assert_eq!(one.as_array().unwrap().len(), 1);
     }
 }
