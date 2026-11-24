@@ -77,7 +77,8 @@ A model value has one of these forms:
 - `<alias>/<uuid>`: that conversation inside that Muse.
 
 `<uuid>` is a Muse session UUID. The part after the slash must be
-`main` or a valid UUID. Any other value gets a 400.
+`main` or a valid UUID. Any other value gets a 400. Alias matching
+is case-insensitive: `muse` and `Muse` name the same Muse.
 
 The conversation in the model wins over the session source. The
 session source is the `X-Session-Id` header, then the `session_id`

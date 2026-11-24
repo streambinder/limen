@@ -816,11 +816,11 @@ mod tests {
         let gadget = FakeGadget::new().with_ask_replies(vec![]);
         let mut gadget = gadget;
         gadget.raw_replies = std::sync::Mutex::new(
-            vec![Ok(json!({"ok": true, "identity": {"name": "Tiro"}}))].into(),
+            vec![Ok(json!({"ok": true, "identity": {"name": "Muse"}}))].into(),
         );
         assert_eq!(
             query_identity_once(&gadget).await,
-            (Some("Tiro".to_string()), None)
+            (Some("Muse".to_string()), None)
         );
         let sent = gadget.raw_sent.lock().unwrap();
         assert_eq!(*sent, vec![json!({"op": "identity"})]);
@@ -872,13 +872,13 @@ mod tests {
             vec![
                 Ok(json!({"ok": false, "error": "not connected"})),
                 Ok(json!({"ok": false, "error": "not connected"})),
-                Ok(json!({"ok": true, "identity": {"name": "Tiro"}})),
+                Ok(json!({"ok": true, "identity": {"name": "Muse"}})),
             ]
             .into(),
         );
         let name =
             discover_muse_name(&gadget, Duration::from_secs(5), Duration::from_millis(0)).await;
-        assert_eq!(name, Some("Tiro".to_string()));
+        assert_eq!(name, Some("Muse".to_string()));
         assert_eq!(gadget.raw_sent.lock().unwrap().len(), 3);
     }
 

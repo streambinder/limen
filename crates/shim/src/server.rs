@@ -116,33 +116,33 @@ mod tests {
             discovery_wait: Duration::from_secs(0),
             ..Config::test_default()
         };
-        let gadget = fake_with_identity(Some("Tiro"));
+        let gadget = fake_with_identity(Some("Muse"));
         startup(&mut config, &gadget).await.unwrap();
-        assert_eq!(config.model_aliases, ["Tiro", "other"]);
+        assert_eq!(config.model_aliases, ["Muse", "other"]);
     }
 
     #[tokio::test]
     async fn startup_does_not_duplicate_discovered_name() {
         let mut config = Config {
-            model_aliases: vec!["Tiro".to_string()],
+            model_aliases: vec!["Muse".to_string()],
             discovery_wait: Duration::from_secs(0),
             ..Config::test_default()
         };
-        let gadget = fake_with_identity(Some("Tiro"));
+        let gadget = fake_with_identity(Some("Muse"));
         startup(&mut config, &gadget).await.unwrap();
-        assert_eq!(config.model_aliases, ["Tiro"]);
+        assert_eq!(config.model_aliases, ["Muse"]);
     }
 
     #[tokio::test]
     async fn startup_falls_back_to_env_aliases_when_discovery_fails() {
         let mut config = Config {
-            model_aliases: vec!["tiro".to_string()],
+            model_aliases: vec!["muse".to_string()],
             discovery_wait: Duration::from_secs(0),
             ..Config::test_default()
         };
         let gadget = fake_with_identity(None);
         startup(&mut config, &gadget).await.unwrap();
-        assert_eq!(config.model_aliases, ["tiro"]);
+        assert_eq!(config.model_aliases, ["muse"]);
     }
 
     #[tokio::test]
