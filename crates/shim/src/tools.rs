@@ -103,8 +103,9 @@ pub fn tools_active(tools: &[ToolDef], choice: &ToolChoice) -> bool {
 /// tool list, then the instruction to answer with tool_calls JSON.
 pub fn tool_appendix(tools: &[ToolDef], choice: &ToolChoice) -> String {
     let mut lines = vec![
-        "You have these tools available. Use one when it helps answer, instead of guessing:"
+        "You have these tools available, but you cannot run them yourself: they run on the caller's machine."
             .to_string(),
+        "Use one when it helps answer, instead of guessing:".to_string(),
     ];
     for tool in tools {
         let params = tool.parameters.as_object().is_some_and(|p| !p.is_empty());
@@ -129,7 +130,8 @@ pub fn tool_appendix(tools: &[ToolDef], choice: &ToolChoice) -> String {
         _ => lines.push(
             "If you use a tool, reply with ONLY a JSON object of the form \
              {\"tool_calls\": [{\"name\": \"<tool>\", \"arguments\": {...}}]} and nothing else. \
-             If you answer directly, just reply with the answer."
+             Never describe a tool call in prose and never use any other tool mechanism. \
+             If you need no tool, just reply with the answer."
                 .to_string(),
         ),
     }
@@ -284,8 +286,12 @@ mod tests {
         assert!(appendix.contains("Multiply two numbers"));
         assert!(appendix.contains("- read: Read a file"));
         assert!(appendix.contains(r#""tool_calls""#));
+        assert!(appendix.contains("you cannot run them yourself"));
+        assert!(appendix.contains("never use any other tool mechanism"));
+        assert!(appendix.contains("If you need no tool"));
         let forced = tool_appendix(&defs(), &ToolChoice::Function("read".to_string()));
         assert!(forced.contains("You must use the `read` tool"));
+        assert!(forced.contains("you cannot run them yourself"));
     }
 
     #[test]
