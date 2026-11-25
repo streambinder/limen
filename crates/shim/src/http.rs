@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::config::{Config, MAX_WAIT_S, log};
 use crate::gadget::{Gadget, GadgetError, SocketItem};
+use crate::image::{ImageInput, extract_image};
 use crate::json::{is_truthy, py_str, python_dumps};
 use crate::model::{model_list, resolve_model};
 use crate::prompt::{build_prompt, extract_text, json_fallback};
@@ -278,7 +279,16 @@ struct StreamRequest {
     cid: String,
     wait: bool,
     listen: bool,
+    image: Option<ImageInput>,
     started: Instant,
+}
+
+/// The turn the hybrid sender task sends: its text, its session,
+/// and its image, if any.
+struct SendTurn {
+    prompt: String,
+    session_id: Option<String>,
+    image: Option<ImageInput>,
 }
 
 enum HybridOutcome {
@@ -406,11 +416,34 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
         let tool_choice = parse_tool_choice(body);
         let tools_on = tools_active(&tools, &tool_choice);
         let mut prompt = build_prompt(body.get("messages").unwrap_or(&Value::Null));
+        // The image rides with this turn: one per request, format
+        // and size enforced here, before the service ever sees it.
+        // It validates first, so a bad image reports its own error
+        // even when the turn has no text yet.
+        let image = if listen_only {
+            None
+        } else {
+            match extract_image(body.get("messages").unwrap_or(&Value::Null)) {
+                Ok(image) => image,
+                Err(message) => {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        &json!({"error": {"message": message}}),
+                    );
+                }
+            }
+        };
+        // An image-only turn still needs words for the service, so
+        // the shim supplies the minimal text itself.
         if prompt.is_empty() && !listen_only {
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": {"message": "no message content"}}),
-            );
+            if image.is_some() {
+                prompt = "user: Image uploaded".to_string();
+            } else {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": {"message": "no message content"}}),
+                );
+            }
         }
         if tools_on {
             prompt.push_str("\n\n");
@@ -472,16 +505,17 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
             prompt.clone()
         };
         log(&format!(
-            "chat model={} session={} prompt_chars={} wait={}",
+            "chat model={} session={} prompt_chars={} wait={} image={}",
             model,
             session_id.as_deref().unwrap_or("main"),
             prompt.chars().count(),
-            if wait { "True" } else { "False" }
+            if wait { "True" } else { "False" },
+            if image.is_some() { "True" } else { "False" },
         ));
         if is_truthy(body.get("stream").unwrap_or(&Value::Null)) {
             if tools_on && wait {
                 return self
-                    .stream_tools_once(prompt, session_id, model, &tools, started)
+                    .stream_tools_once(prompt, session_id, model, &tools, started, image)
                     .await;
             }
             return self
@@ -493,6 +527,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
                     cid,
                     wait,
                     listen: listen_only,
+                    image,
                     started,
                 })
                 .await;
@@ -504,6 +539,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
                     session_id,
                     Some(std::cmp::min(self.config.reply_wait_s, MAX_WAIT_S)),
                     started,
+                    image,
                 )
                 .await
             {
@@ -512,7 +548,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
             }
         } else {
             match self
-                .ask_turn_content(forwarded, session_id, None, started)
+                .ask_turn_content(forwarded, session_id, None, started, image)
                 .await
             {
                 Ok(content) => content,
@@ -544,8 +580,9 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
         session_id: Option<String>,
         wait_s: Option<u64>,
         started: Instant,
+        image: Option<ImageInput>,
     ) -> Result<String, Box<HttpResponse>> {
-        let reply = self.gadget.ask(prompt, session_id, wait_s).await;
+        let reply = self.gadget.ask(prompt, session_id, wait_s, image).await;
         let elapsed = started.elapsed().as_secs_f32();
         let reply = match reply {
             Ok(reply) => reply,
@@ -593,6 +630,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
         model: String,
         tools: &[ToolDef],
         started: Instant,
+        image: Option<ImageInput>,
     ) -> HttpResponse {
         let content = match self
             .ask_turn_content(
@@ -600,6 +638,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
                 session_id,
                 Some(std::cmp::min(self.config.reply_wait_s, MAX_WAIT_S)),
                 started,
+                image,
             )
             .await
         {
@@ -696,6 +735,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
             cid,
             wait,
             listen,
+            image,
             started,
         } = request;
         let now = SystemTime::now()
@@ -725,8 +765,11 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
         if wait {
             match self
                 .stream_hybrid(
-                    &prompt,
-                    session_id.as_deref(),
+                    SendTurn {
+                        prompt,
+                        session_id: session_id.clone(),
+                        image: image.clone(),
+                    },
                     &mut translator,
                     &mut sink,
                     started,
@@ -745,7 +788,9 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
                 }
             }
         }
-        let rx = self.gadget.stream(&forwarded, session_id.as_deref());
+        let rx = self
+            .gadget
+            .stream(&forwarded, session_id.as_deref(), image.as_ref());
         let (result, error) = drain(rx, &mut translator, &mut sink, started).await;
         if drain_outcome(&result, error, &sink, &tx).await {
             return;
@@ -784,20 +829,24 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
     /// path (send without wait, subscription, drop) must run.
     async fn stream_hybrid(
         &self,
-        prompt: &str,
-        session_id: Option<&str>,
+        turn: SendTurn,
         translator: &mut StreamTranslator,
         sink: &mut SseSink,
         started: Instant,
         tx: &mpsc::UnboundedSender<StreamMsg>,
     ) -> HybridOutcome {
+        let SendTurn {
+            prompt,
+            session_id,
+            image,
+        } = turn;
         let (ready_tx, ready_rx) = watch::channel(false);
         let (stop_tx, stop_rx) = watch::channel(false);
         let slot: Arc<std::sync::Mutex<HybridSlot>> =
             Arc::new(std::sync::Mutex::new(HybridSlot::default()));
         let gadget = self.gadget.clone();
-        let prompt_owned = prompt.to_string();
-        let session_owned = session_id.map(str::to_string);
+        let prompt_owned = prompt;
+        let session_owned = session_id.clone();
         let sender_session = session_owned.clone();
         let wait_s = std::cmp::min(self.config.reply_wait_s, MAX_WAIT_S);
         let slot_sender = slot.clone();
@@ -816,7 +865,9 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            let outcome = gadget.ask(prompt_owned, sender_session, Some(wait_s)).await;
+            let outcome = gadget
+                .ask(prompt_owned, sender_session, Some(wait_s), image)
+                .await;
             let mut slot = slot_sender.lock().unwrap();
             match outcome {
                 Ok(reply) => slot.reply = Some(reply),
@@ -826,7 +877,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
         });
         let rx = self
             .gadget
-            .listen(session_id, Some(ready_tx), Some(stop_rx));
+            .listen(session_id.as_deref(), Some(ready_tx), Some(stop_rx));
         let (_result, error) = drain(rx, translator, sink, started).await;
         let _ = stop_tx.send(true);
         let _ = sender.await;
@@ -1391,7 +1442,12 @@ mod tests {
         let calls = gadget.ask_calls.lock().unwrap();
         assert_eq!(
             *calls,
-            vec![("user: hi".to_string(), Some("My-Session".to_string()), None)]
+            vec![(
+                "user: hi".to_string(),
+                Some("My-Session".to_string()),
+                None,
+                None
+            )]
         );
     }
 
@@ -1601,7 +1657,12 @@ mod tests {
         let calls = gadget.ask_calls.lock().unwrap();
         assert_eq!(
             *calls,
-            vec![("user: hi".to_string(), Some("sess-9".to_string()), Some(30))]
+            vec![(
+                "user: hi".to_string(),
+                Some("sess-9".to_string()),
+                Some(30),
+                None
+            )]
         );
     }
 
@@ -1621,7 +1682,8 @@ mod tests {
             vec![(
                 "user: hi".to_string(),
                 Some("sess-header".to_string()),
-                Some(30)
+                Some(30),
+                None
             )]
         );
     }
@@ -1648,7 +1710,8 @@ mod tests {
             vec![(
                 "user: hi".to_string(),
                 Some("12345678-1234-1234-1234-1234567890ab".to_string()),
-                Some(30)
+                Some(30),
+                None
             )]
         );
     }
@@ -1663,7 +1726,79 @@ mod tests {
         .await;
         assert_eq!(status, 200);
         let calls = gadget.ask_calls.lock().unwrap();
-        assert_eq!(*calls, vec![("user: hi".to_string(), None, Some(30))]);
+        assert_eq!(*calls, vec![("user: hi".to_string(), None, Some(30), None)]);
+    }
+
+    #[tokio::test]
+    async fn post_completion_forwards_image_to_gadget() {
+        let gadget = gadget_with_reply(json!({"ok": true, "reply": "saw it", "response": "r"}));
+        let (status, _, raw) = completion_case(
+            gadget.clone(),
+            r#"{"messages": [{"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}]}], "model": "muse"}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            json_body(&raw)["choices"][0]["message"]["content"],
+            "saw it"
+        );
+        let calls = gadget.ask_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].3,
+            Some(ImageInput {
+                mime_type: "image/png".to_string(),
+                data_base64: "aGk=".to_string(),
+                filename: "image.png".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn post_image_validation_is_400() {
+        let gadget = Arc::new(FakeGadget::new());
+        let (status, _, raw) = completion_case(
+            gadget.clone(),
+            r#"{"messages": [{"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]}], "model": "muse"}"#,
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert_error_contains(&raw, "base64 data URLs");
+        assert!(gadget.ask_calls.lock().unwrap().is_empty());
+        let (status, _, raw) = completion_case(
+            gadget.clone(),
+            r#"{"messages": [{"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}]}], "model": "muse"}"#,
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert_error_contains(&raw, "one image per request");
+        assert!(gadget.ask_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_image_without_text_sends_placeholder() {
+        let gadget = gadget_with_reply(json!({"ok": true, "reply": "saw it", "response": "r"}));
+        let (status, _, raw) = completion_case(
+            gadget.clone(),
+            r#"{"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}]}], "model": "muse"}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            json_body(&raw)["choices"][0]["message"]["content"],
+            "saw it"
+        );
+        let calls = gadget.ask_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "user: Image uploaded");
+        assert_eq!(
+            calls[0].3,
+            Some(ImageInput {
+                mime_type: "image/png".to_string(),
+                data_base64: "aGk=".to_string(),
+                filename: "image.png".to_string(),
+            })
+        );
     }
 
     #[tokio::test]
@@ -2097,7 +2232,8 @@ mod tests {
             *stream_calls,
             vec![(
                 "user: hi".to_string(),
-                Some("12345678-1234-1234-1234-1234567890ab".to_string())
+                Some("12345678-1234-1234-1234-1234567890ab".to_string()),
+                None
             )]
         );
         assert!(String::from_utf8_lossy(&raw).contains(r#""content": "hi""#));

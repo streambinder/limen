@@ -156,6 +156,7 @@ class _FakeSession:
 
     def __init__(self):
         self.sent = None
+        self.sent_image = None
 
     async def subscribe_chat(self, session_id=None):
         def row(seq, payload):
@@ -181,6 +182,48 @@ class _FakeSession:
     async def send_chat(self, message, session_id=None):
         self.sent = (message, session_id)
         return {"ok": True, "status": 200, "response": {"message_id": "note-1"}}
+
+    async def send_image(
+        self,
+        image_bytes,
+        mime_type,
+        session_id=None,
+        message="",
+        filename=None,
+        output_modality="text",
+    ):
+        self.sent_image = (image_bytes, mime_type, session_id, message, filename)
+        return {"ok": True, "status": 200, "response": {"message_id": "note-1"}}
+
+
+def test_local_stream_request_sends_image(patched_sdk):
+    svc = object.__new__(patched_sdk.Service)
+    session = _FakeSession()
+    svc._current = session
+    writer = _FakeWriter()
+    image = {"mime_type": "image/png", "data_base64": "aGk=", "filename": "image.png"}
+    line = json.dumps(
+        {"message": "look", "session_id": "chat-1", "subscribe": True, "image": image}
+    ).encode()
+    asyncio.run(svc._local_stream_request(line, writer))
+    assert session.sent is None
+    assert session.sent_image == (b"hi", "image/png", "chat-1", "look", "image.png")
+    objs = [json.loads(data) for data in writer.lines]
+    assert objs[-1] == {"ok": True, "status": 200, "response": {"message_id": "note-1"}}
+
+
+def test_local_stream_request_rejects_bad_image(patched_sdk):
+    svc = object.__new__(patched_sdk.Service)
+    session = _FakeSession()
+    svc._current = session
+    writer = _FakeWriter()
+    bad = {"mime_type": "image/bmp", "data_base64": "aGk="}
+    line = json.dumps({"message": "look", "subscribe": True, "image": bad}).encode()
+    asyncio.run(svc._local_stream_request(line, writer))
+    assert session.sent is None
+    assert session.sent_image is None
+    objs = [json.loads(data) for data in writer.lines]
+    assert objs == [{"ok": False, "error": "images must be JPEG, PNG, GIF or WebP"}]
 
 
 def test_local_stream_request_streams_events_then_result(patched_sdk):
