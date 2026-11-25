@@ -359,7 +359,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
         }
         json_response(
             StatusCode::OK,
-            &json!({"object": "list", "data": model_list(&self.config.model_aliases, self.config.context_window)}),
+            &json!({"object": "list", "data": model_list(&self.config.model_aliases, self.config.context_window, &self.config.session_aliases)}),
         )
     }
 
@@ -480,6 +480,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
             &model,
             session_source.as_deref(),
             &self.config.model_aliases,
+            &self.config.session_aliases,
         ) {
             Ok(route) => route,
             Err(err) => {
@@ -495,6 +496,14 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
             }
         };
         let session_id = route.session_id;
+        // A named session may carry its own prompt: it goes first,
+        // as a system line, ahead of the request's own messages and
+        // of the tools appendix.
+        if let Some(name) = &route.session_alias
+            && let Some(custom) = self.config.session_prompts.get(name)
+        {
+            prompt = format!("system: {custom}\n\n{prompt}");
+        }
         let cid = Uuid::new_v4().simple().to_string();
         let wait = !listen_only
             && self.config.reply_wait_s > 0
@@ -1309,6 +1318,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_models_lists_session_aliases() {
+        let config = Config {
+            model_aliases: vec!["muse".to_string()],
+            session_aliases: std::collections::HashMap::from([(
+                "alice".to_string(),
+                "12345678-1234-1234-1234-1234567890ab".to_string(),
+            )]),
+            ..config_open()
+        };
+        let gadget = Arc::new(FakeGadget::new());
+        let server = serve_with(config, gadget, Arc::new(FakeReplyWait::new())).await;
+        let (status, _, raw) = http_request(server.port, "GET", "/v1/models", None, &[]).await;
+        assert_eq!(status, 200);
+        let body = json_body(&raw);
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["muse", "muse/alice"]);
+    }
+
+    #[tokio::test]
     async fn get_models_auth() {
         let config = Config {
             api_keys: vec!["k1".to_string(), "k2".to_string()],
@@ -1755,6 +1788,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_completion_prepends_session_prompt() {
+        let config = Config {
+            session_aliases: std::collections::HashMap::from([(
+                "alice".to_string(),
+                "12345678-1234-1234-1234-1234567890ab".to_string(),
+            )]),
+            session_prompts: std::collections::HashMap::from([(
+                "alice".to_string(),
+                "You are talking to Alice, who likes short answers.".to_string(),
+            )]),
+            ..config_open()
+        };
+        let gadget = gadget_with_reply(json!({"ok": true, "reply": "hi", "response": "r"}));
+        let (status, _, raw) = completion_case_with_config(
+            gadget.clone(),
+            config,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "muse/alice"}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(json_body(&raw)["choices"][0]["message"]["content"], "hi");
+        let (sent_prompt, sent_session) = {
+            let calls = gadget.ask_calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            (calls[0].0.clone(), calls[0].1.clone())
+        };
+        assert_eq!(
+            sent_prompt,
+            "system: You are talking to Alice, who likes short answers.\n\nuser: hi"
+        );
+        assert_eq!(
+            sent_session,
+            Some("12345678-1234-1234-1234-1234567890ab".to_string())
+        );
+        let gadget = gadget_with_reply(json!({"ok": true, "reply": "hi", "response": "r"}));
+        let (status, _, raw) = completion_case_with_config(
+            gadget.clone(),
+            config_open(),
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "muse/alice"}"#,
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert_error_contains(&raw, "Invalid model");
+    }
+
+    #[tokio::test]
     async fn post_image_validation_is_400() {
         let gadget = Arc::new(FakeGadget::new());
         let (status, _, raw) = completion_case(
@@ -1900,7 +1979,16 @@ mod tests {
         gadget: Arc<FakeGadget>,
         body: &str,
     ) -> (u16, Option<String>, Vec<u8>) {
-        let server = serve_with(config_open(), gadget, Arc::new(FakeReplyWait::new())).await;
+        completion_case_with_config(gadget, config_open(), body).await
+    }
+
+    /// Serve a fake gadget with a given config and post a completion.
+    async fn completion_case_with_config(
+        gadget: Arc<FakeGadget>,
+        config: Config,
+        body: &str,
+    ) -> (u16, Option<String>, Vec<u8>) {
+        let server = serve_with(config, gadget, Arc::new(FakeReplyWait::new())).await;
         post(server.port, body, &[]).await
     }
 

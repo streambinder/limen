@@ -118,10 +118,13 @@ A model value has one of these forms:
 - `<alias>`: that Muse, main chat.
 - `<alias>/main`: that Muse, main chat, spelled out.
 - `<alias>/<uuid>`: that conversation inside that Muse.
+- `<alias>/<name>`: the named session inside that Muse, from
+  `SHIM_SESSION_ALIASES`. See [Session aliases](#session-aliases).
 
 `<uuid>` is a Muse session UUID. The part after the slash must be
-`main` or a valid UUID. Any other value gets a 400. Alias matching
-is case-insensitive: `muse` and `Muse` name the same Muse.
+`main`, a valid UUID, or a configured session name. Any other value
+gets a 400. Alias matching is case-insensitive: `muse` and `Muse`
+name the same Muse.
 
 The conversation in the model wins over the session source. The
 session source is the `X-Session-Id` header, then the `session_id`
@@ -131,3 +134,25 @@ that sends no model gets a 400. A client that sends no
 session source and a bare model lands on the main chat.
 
 An unknown alias gets a 404 with code `model_not_found`.
+
+## Session aliases
+
+A client that cannot send a session header can still reach a
+specific conversation by name. `SHIM_SESSION_ALIASES` maps a
+session name to a Muse session UUID, as a JSON object:
+
+`{"alice": "12345678-1234-1234-1234-1234567890ab"}`
+
+With that mapping the model `muse/alice` reaches that
+conversation, and `GET /v1/models` lists `muse/alice` next to the
+bare aliases. Names are matched case-insensitively; `main` is
+reserved. An unknown name gets a 400.
+
+`SHIM_SESSION_PROMPTS` maps a session name to a custom prompt,
+as a JSON object. The prompt is prepended to the turn as a
+system line, ahead of the request's own messages and of the
+tools appendix. A prompt for a name with no session alias is a
+startup error, and the shim refuses to start.
+
+To find a session UUID, create a conversation in the Muse app
+and ask the Muse in that conversation for its session ID.

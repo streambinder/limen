@@ -3,9 +3,12 @@
 //! Every value mirrors a module-level constant of the Python shim,
 //! same name and same default.
 
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::model::is_uuid;
 
 pub const DEFAULT_SOCKET_PATH: &str = "/run/musegadget/musegadget.sock";
 pub const DEFAULT_PORT: u16 = 8001;
@@ -27,6 +30,10 @@ pub struct Config {
     pub port: u16,
     pub timeout: Duration,
     pub model_aliases: Vec<String>,
+    /// Named sessions: lowercase name to session UUID.
+    pub session_aliases: HashMap<String, String>,
+    /// Custom prompt per named session, keyed by lowercase name.
+    pub session_prompts: HashMap<String, String>,
     pub context_window: u64,
     pub discovery_wait: Duration,
     pub discovery_poll: Duration,
@@ -43,6 +50,8 @@ impl Default for Config {
             port: DEFAULT_PORT,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_S),
             model_aliases: Vec::new(),
+            session_aliases: HashMap::new(),
+            session_prompts: HashMap::new(),
             context_window: DEFAULT_CONTEXT_WINDOW,
             discovery_wait: Duration::from_secs(DEFAULT_DISCOVERY_WAIT_S),
             discovery_poll: DEFAULT_DISCOVERY_POLL,
@@ -86,16 +95,87 @@ fn env_list(name: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parse `SHIM_SESSION_ALIASES`: a JSON object mapping a session
+/// name to a session UUID, for example
+/// `{"alice": "12345678-1234-1234-1234-1234567890ab"}`. Names are
+/// matched case-insensitively; `main` is reserved and rejected.
+pub fn parse_session_aliases(raw: &str) -> Result<HashMap<String, String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let parsed: HashMap<String, String> = serde_json::from_str(trimmed)
+        .map_err(|err| format!("SHIM_SESSION_ALIASES is not a JSON object: {err}"))?;
+    let mut out = HashMap::new();
+    for (name, uuid) in parsed {
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty() || name.contains('/') || name.contains(char::is_whitespace) {
+            return Err(format!(
+                "SHIM_SESSION_ALIASES has an invalid session name {name:?}"
+            ));
+        }
+        if name == "main" {
+            return Err("SHIM_SESSION_ALIASES must not define \"main\"".to_string());
+        }
+        let uuid = uuid.trim().to_ascii_lowercase();
+        if !is_uuid(&uuid) {
+            return Err(format!(
+                "SHIM_SESSION_ALIASES[{name}] is not a UUID: {uuid:?}"
+            ));
+        }
+        if out.insert(name.clone(), uuid).is_some() {
+            return Err(format!("SHIM_SESSION_ALIASES defines {name:?} twice"));
+        }
+    }
+    Ok(out)
+}
+
+/// Parse `SHIM_SESSION_PROMPTS`: a JSON object mapping a session
+/// name to its custom prompt. Every name must have a session alias;
+/// prompts are empty when unset.
+pub fn parse_session_prompts(
+    raw: &str,
+    aliases: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let parsed: HashMap<String, String> = serde_json::from_str(trimmed)
+        .map_err(|err| format!("SHIM_SESSION_PROMPTS is not a JSON object: {err}"))?;
+    let mut out = HashMap::new();
+    for (name, prompt) in parsed {
+        let name = name.trim().to_ascii_lowercase();
+        if !aliases.contains_key(&name) {
+            return Err(format!("SHIM_SESSION_PROMPTS[{name}] has no session alias"));
+        }
+        let prompt = prompt.trim().to_string();
+        if prompt.is_empty() {
+            return Err(format!("SHIM_SESSION_PROMPTS[{name}] is empty"));
+        }
+        out.insert(name, prompt);
+    }
+    Ok(out)
+}
+
 impl Config {
     /// Read the configuration from the environment, like the Python
     /// shim's module-level `os.environ.get` calls.
     pub fn from_env() -> Result<Config, String> {
+        let session_aliases =
+            parse_session_aliases(&env::var("SHIM_SESSION_ALIASES").unwrap_or_default())?;
+        let session_prompts = parse_session_prompts(
+            &env::var("SHIM_SESSION_PROMPTS").unwrap_or_default(),
+            &session_aliases,
+        )?;
         Ok(Config {
             socket_path: env::var("MUSEGADGET_SOCKET")
                 .unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string()),
             port: env_u16("SHIM_PORT", DEFAULT_PORT)?,
             timeout: Duration::from_secs(env_u64("SHIM_TIMEOUT_S", DEFAULT_TIMEOUT_S)?),
             model_aliases: env_list("SHIM_MODEL_ALIASES"),
+            session_aliases,
+            session_prompts,
             context_window: env_u64("SHIM_CONTEXT_WINDOW", DEFAULT_CONTEXT_WINDOW)?,
             discovery_wait: Duration::from_secs(env_u64(
                 "SHIM_DISCOVERY_WAIT_S",
@@ -161,5 +241,65 @@ mod tests {
         assert_eq!(config.reply_wait_s, 600);
         assert_eq!(config.context_window, 1_000_000);
         assert_eq!(MAX_WAIT_S, 600);
+        assert!(config.session_aliases.is_empty());
+        assert!(config.session_prompts.is_empty());
+    }
+
+    #[test]
+    fn parse_session_aliases_cases() {
+        assert!(parse_session_aliases("").unwrap().is_empty());
+        assert!(parse_session_aliases("  ").unwrap().is_empty());
+        let one =
+            parse_session_aliases(r#"{"Alice": "12345678-1234-1234-1234-1234567890AB"}"#).unwrap();
+        assert_eq!(
+            one.get("alice"),
+            Some(&"12345678-1234-1234-1234-1234567890ab".to_string())
+        );
+        assert!(parse_session_aliases("not json").is_err());
+        assert!(parse_session_aliases(r#"["alice"]"#).is_err());
+        assert!(
+            parse_session_aliases(r#"{"alice": "not-a-uuid"}"#)
+                .unwrap_err()
+                .contains("is not a UUID")
+        );
+        assert!(
+            parse_session_aliases(r#"{"main": "12345678-1234-1234-1234-1234567890ab"}"#)
+                .unwrap_err()
+                .contains("must not define")
+        );
+        assert!(
+            parse_session_aliases(r#"{"a/b": "12345678-1234-1234-1234-1234567890ab"}"#).is_err()
+        );
+        assert!(
+            parse_session_aliases(
+                r#"{"Alice": "12345678-1234-1234-1234-1234567890ab", "alice": "12345678-1234-1234-1234-1234567890ab"}"#
+            )
+            .unwrap_err()
+            .contains("twice")
+        );
+    }
+
+    #[test]
+    fn parse_session_prompts_cases() {
+        let aliases =
+            parse_session_aliases(r#"{"alice": "12345678-1234-1234-1234-1234567890ab"}"#).unwrap();
+        assert!(parse_session_prompts("", &aliases).unwrap().is_empty());
+        let one = parse_session_prompts(r#"{"Alice": "  You are talking to Alice.  "}"#, &aliases)
+            .unwrap();
+        assert_eq!(
+            one.get("alice"),
+            Some(&"You are talking to Alice.".to_string())
+        );
+        assert!(
+            parse_session_prompts(r#"{"bob": "hi"}"#, &aliases)
+                .unwrap_err()
+                .contains("has no session alias")
+        );
+        assert!(
+            parse_session_prompts(r#"{"alice": "  "}"#, &aliases)
+                .unwrap_err()
+                .contains("is empty")
+        );
+        assert!(parse_session_prompts("not json", &aliases).is_err());
     }
 }
