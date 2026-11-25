@@ -1,6 +1,6 @@
 #!/bin/sh
 # Entrypoint for the limen container.
-# Modes: run (default) | pair | info | send | <any musegadget subcommand>
+# Modes: run (default) | service | pair | info | send | <any musegadget subcommand>
 set -eu
 
 STATE_DIR="${MUSEGADGET_STATE_DIR:-/var/lib/musegadget}"
@@ -22,6 +22,11 @@ pair)
 run)
 	# Shim in background; the gadget service is the main process.
 	/usr/local/bin/limen-shim &
+	exec musegadget run --run-as "${MUSEGADGET_RUN_AS:-gadget}"
+	;;
+service)
+	# Gadget service only, no shim: one container per extra Muse.
+	# The shim in the main container reaches it over its socket.
 	exec musegadget run --run-as "${MUSEGADGET_RUN_AS:-gadget}"
 	;;
 info)

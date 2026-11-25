@@ -7,30 +7,118 @@ use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::config::{Config, log};
 use crate::gadget::{Gadget, discover_muse_name};
 use crate::http::Shim;
+use crate::model::MuseInfo;
 use crate::replies::ReplyWait;
 
-/// Resolve the model aliases at startup: identity discovery first
-/// (the discovered name goes first), the configured aliases as the
-/// fallback. Refuses to start with no alias at all.
-pub async fn startup<G: Gadget>(config: &mut Config, gadget: &G) -> Result<(), String> {
-    let discovered = discover_muse_name(gadget, config.discovery_wait, config.discovery_poll).await;
-    if let Some(name) = discovered {
-        if !config.model_aliases.contains(&name) {
-            config.model_aliases.insert(0, name.clone());
-        }
-        log(&format!("discovered Muse model `{name}`"));
+/// Resolve the model aliases at startup: discover each Muse's
+/// name from its own socket, in parallel, each with the configured
+/// discovery wait/poll. The primary (first socket) keeps the
+/// current behavior: discovery failure falls back to
+/// `SHIM_MODEL_ALIASES`, and the shim refuses to start only when
+/// no alias at all remains. Any additional socket whose Muse
+/// cannot be discovered is a startup error naming the socket. Two
+/// sockets discovering the same Muse name, or a session-map Muse
+/// key matching no discovered Muse, is a startup error too.
+/// After discovery, each Muse's alias list is its discovered name
+/// first, then `SHIM_MODEL_ALIASES` for the primary only.
+pub async fn startup<G: Gadget + 'static>(
+    config: &mut Config,
+    gadgets: &[Arc<G>],
+) -> Result<(), String> {
+    let mut handles = Vec::new();
+    for gadget in gadgets {
+        let gadget = gadget.clone();
+        let wait = config.discovery_wait;
+        let poll = config.discovery_poll;
+        handles.push(tokio::spawn(async move {
+            discover_muse_name(&*gadget, wait, poll).await
+        }));
     }
-    if config.model_aliases.is_empty() {
+    let mut names: Vec<Option<String>> = Vec::new();
+    for handle in handles {
+        let name = handle
+            .await
+            .map_err(|e| format!("discovery task failed: {e}"))?;
+        names.push(name);
+    }
+    let mut muses: Vec<MuseInfo> = Vec::new();
+    for (index, (socket, name)) in config.gadget_sockets.iter().zip(names.iter()).enumerate() {
+        let primary = index == 0;
+        let Some(name) = name else {
+            if primary {
+                if config.model_aliases.is_empty() {
+                    continue;
+                }
+                muses.push(MuseInfo {
+                    key: config.model_aliases[0].to_ascii_lowercase(),
+                    aliases: config.model_aliases.clone(),
+                    socket_path: socket.clone(),
+                });
+                continue;
+            }
+            return Err(format!(
+                "could not discover the Muse on socket {socket}: \
+                 the service is not answering or not paired"
+            ));
+        };
+        let key = name.to_ascii_lowercase();
+        let mut aliases = vec![name.clone()];
+        if primary {
+            for alias in &config.model_aliases {
+                if !aliases.iter().any(|a| a.eq_ignore_ascii_case(alias)) {
+                    aliases.push(alias.clone());
+                }
+            }
+        }
+        muses.push(MuseInfo {
+            key,
+            aliases,
+            socket_path: socket.clone(),
+        });
+        log(&format!("discovered Muse model `{name}` on {socket}"));
+    }
+    if muses.is_empty() {
         return Err(
             "no Muse model found: identity discovery failed and SHIM_MODEL_ALIASES is not set"
                 .to_string(),
         );
     }
+    // No alias may name two Muses: routing would be ambiguous.
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for muse in &muses {
+        for alias in &muse.aliases {
+            let lowered = alias.to_ascii_lowercase();
+            if let Some((other, _)) = seen.iter().find(|(a, _)| *a == lowered) {
+                return Err(format!(
+                    "alias {alias:?} names two Muses ({other} and {})",
+                    muse.key
+                ));
+            }
+            seen.push((lowered, muse.key.clone()));
+        }
+    }
+    // A session-map Muse key must match a discovered Muse.
+    for key in config.session_aliases.keys() {
+        if !muses.iter().any(|muse| muse.key == *key) {
+            return Err(format!(
+                "SHIM_SESSION_ALIASES names Muse {key:?}, which no socket discovered"
+            ));
+        }
+    }
+    for key in config.session_prompts.keys() {
+        if !muses.iter().any(|muse| muse.key == *key) {
+            return Err(format!(
+                "SHIM_SESSION_PROMPTS names Muse {key:?}, which no socket discovered"
+            ));
+        }
+    }
+    config.muses = muses;
     Ok(())
 }
 
@@ -68,9 +156,9 @@ pub async fn serve<G: Gadget + 'static, R: ReplyWait + 'static>(
     let addr = SocketAddr::from(([0, 0, 0, 0], shim.config.port));
     bind_and_serve(shim.clone(), addr).await?;
     log(&format!(
-        "listening on :{}, socket={}, timeout={}s",
+        "listening on :{}, sockets={}, timeout={}s",
         shim.config.port,
-        shim.config.socket_path,
+        shim.config.gadget_sockets.join(","),
         shim.config.timeout.as_secs()
     ));
     if !shim.config.api_keys.is_empty() {
@@ -109,6 +197,11 @@ mod tests {
         gadget
     }
 
+    async fn start(config: &mut Config, gadgets: Vec<FakeGadget>) -> Result<(), String> {
+        let arcs: Vec<Arc<FakeGadget>> = gadgets.into_iter().map(Arc::new).collect();
+        startup(config, &arcs).await
+    }
+
     #[tokio::test]
     async fn startup_registers_discovered_name_first() {
         let mut config = Config {
@@ -116,9 +209,12 @@ mod tests {
             discovery_wait: Duration::from_secs(0),
             ..Config::test_default()
         };
-        let gadget = fake_with_identity(Some("Muse"));
-        startup(&mut config, &gadget).await.unwrap();
-        assert_eq!(config.model_aliases, ["Muse", "other"]);
+        start(&mut config, vec![fake_with_identity(Some("Muse"))])
+            .await
+            .unwrap();
+        assert_eq!(config.muses.len(), 1);
+        assert_eq!(config.muses[0].key, "muse");
+        assert_eq!(config.muses[0].aliases, ["Muse", "other"]);
     }
 
     #[tokio::test]
@@ -128,9 +224,10 @@ mod tests {
             discovery_wait: Duration::from_secs(0),
             ..Config::test_default()
         };
-        let gadget = fake_with_identity(Some("Muse"));
-        startup(&mut config, &gadget).await.unwrap();
-        assert_eq!(config.model_aliases, ["Muse"]);
+        start(&mut config, vec![fake_with_identity(Some("Muse"))])
+            .await
+            .unwrap();
+        assert_eq!(config.muses[0].aliases, ["Muse"]);
     }
 
     #[tokio::test]
@@ -140,9 +237,11 @@ mod tests {
             discovery_wait: Duration::from_secs(0),
             ..Config::test_default()
         };
-        let gadget = fake_with_identity(None);
-        startup(&mut config, &gadget).await.unwrap();
-        assert_eq!(config.model_aliases, ["muse"]);
+        start(&mut config, vec![fake_with_identity(None)])
+            .await
+            .unwrap();
+        assert_eq!(config.muses[0].aliases, ["muse"]);
+        assert_eq!(config.muses[0].key, "muse");
     }
 
     #[tokio::test]
@@ -152,9 +251,97 @@ mod tests {
             discovery_wait: Duration::from_secs(0),
             ..Config::test_default()
         };
-        let gadget = fake_with_identity(None);
-        let err = startup(&mut config, &gadget).await.unwrap_err();
+        let err = start(&mut config, vec![fake_with_identity(None)])
+            .await
+            .unwrap_err();
         assert!(err.contains("SHIM_MODEL_ALIASES"));
+    }
+
+    #[tokio::test]
+    async fn startup_discovers_two_muses_in_socket_order() {
+        let mut config = Config {
+            gadget_sockets: vec![
+                "/run/musegadget/musegadget.sock".to_string(),
+                "/run/other/musegadget.sock".to_string(),
+            ],
+            discovery_wait: Duration::from_secs(0),
+            ..Config::test_default()
+        };
+        start(
+            &mut config,
+            vec![
+                fake_with_identity(Some("Muse")),
+                fake_with_identity(Some("Other")),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(config.muses.len(), 2);
+        assert_eq!(config.muses[0].key, "muse");
+        assert_eq!(config.muses[0].aliases, ["Muse"]);
+        assert_eq!(config.muses[1].key, "other");
+        assert_eq!(config.muses[1].aliases, ["Other"]);
+        assert_eq!(config.muses[1].socket_path, "/run/other/musegadget.sock");
+    }
+
+    #[tokio::test]
+    async fn startup_fails_when_second_socket_undiscovered() {
+        let mut config = Config {
+            gadget_sockets: vec![
+                "/run/musegadget/musegadget.sock".to_string(),
+                "/run/other/musegadget.sock".to_string(),
+            ],
+            discovery_wait: Duration::from_secs(0),
+            ..Config::test_default()
+        };
+        let err = start(
+            &mut config,
+            vec![fake_with_identity(Some("Muse")), fake_with_identity(None)],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("/run/other/musegadget.sock"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn startup_fails_on_duplicate_discovered_name() {
+        let mut config = Config {
+            gadget_sockets: vec![
+                "/run/musegadget/musegadget.sock".to_string(),
+                "/run/other/musegadget.sock".to_string(),
+            ],
+            discovery_wait: Duration::from_secs(0),
+            ..Config::test_default()
+        };
+        let err = start(
+            &mut config,
+            vec![
+                fake_with_identity(Some("Muse")),
+                fake_with_identity(Some("MUSE")),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("two Muses"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn startup_fails_on_unknown_session_map_muse() {
+        let mut config = Config {
+            session_aliases: std::collections::HashMap::from([(
+                "nope".to_string(),
+                std::collections::HashMap::from([(
+                    "alice".to_string(),
+                    "12345678-1234-1234-1234-1234567890ab".to_string(),
+                )]),
+            )]),
+            discovery_wait: Duration::from_secs(0),
+            ..Config::test_default()
+        };
+        let err = start(&mut config, vec![fake_with_identity(Some("Muse"))])
+            .await
+            .unwrap_err();
+        assert!(err.contains("nope"), "{err}");
     }
 
     #[tokio::test]

@@ -52,10 +52,14 @@ mode requires `stream: true`.
 
 ## Models and health
 
-`GET /v1/models` lists the discovered Muse name first, then the configured aliases.
-Each entry also reports `context_window`, from `SHIM_CONTEXT_WINDOW` (default 1000000).
-`GET /healthz` returns 200 when the gadget socket exists
-and 503 when it does not. The health endpoint needs no key.
+`GET /v1/models` lists, per Muse in socket order, that Muse's
+aliases, then `<first-alias-of-that-Muse>/<name>` per session
+alias under that Muse. Each entry also reports
+`context_window`, from `SHIM_CONTEXT_WINDOW` (default 1000000).
+`GET /healthz` returns 200 when every configured gadget socket
+exists and 503 when any is missing. The body reports each
+socket: `{"ok": true, "sockets": {"muse": true, "other": false}}`.
+The health endpoint needs no key.
 
 ## Tool calling
 
@@ -103,13 +107,14 @@ error message. The `detail` field, when present, is ignored.
 
 The model in a completion request names a Muse and, optionally, a
 conversation inside it. There is no default model: at startup the
-shim learns the attached Muse's name from the gadget service and
-serves it as its model. `SHIM_MODEL_ALIASES` adds further names for
-the same Muse and is the fallback when discovery fails; with
-neither the shim refuses to start.
+shim learns each attached Muse's name from its gadget service and
+serves it as its model. `SHIM_MODEL_ALIASES` adds further names
+for the primary Muse only, and is the fallback when discovery
+fails; with neither the shim refuses to start. See
+[Multiple Muses](#multiple-muses).
 
-Discovery asks the service for the Muse identity (`GET /identity`)
-through the local socket. The service may not be registered yet
+Discovery asks each service for the Muse identity (`GET /identity`)
+through its local socket. A service may not be registered yet
 when the shim starts, so discovery retries for up to
 `SHIM_DISCOVERY_WAIT_S` seconds.
 
@@ -135,24 +140,47 @@ session source and a bare model lands on the main chat.
 
 An unknown alias gets a 404 with code `model_not_found`.
 
+## Multiple Muses
+
+One shim can serve several Muses, one gadget service per Muse.
+`SHIM_GADGET_SOCKETS` lists the service sockets, in order; the
+first socket's Muse is the primary. Each service is discovered
+separately, in parallel. A service that cannot be discovered
+fails startup, except the primary, which falls back to
+`SHIM_MODEL_ALIASES` as in the single-Muse case. Two sockets
+discovering the same Muse name is a startup error: routing
+would be ambiguous.
+
+Each Muse has its own alias list: its discovered name first,
+then `SHIM_MODEL_ALIASES` for the primary only. Additional
+Muses are addressed by their discovered name only. Session
+aliases and prompts are per Muse: the same name may map to
+different sessions under different Muses, and a turn for
+`other/alice` reaches the second Muse's session, never the
+first's. A session-map Muse key matching no discovered Muse
+is a startup error.
+
 ## Session aliases
 
 A client that cannot send a session header can still reach a
 specific conversation by name. `SHIM_SESSION_ALIASES` maps a
-session name to a Muse session UUID, as a JSON object:
+Muse key to a session name to a Muse session UUID, as a nested
+JSON object:
 
-`{"alice": "12345678-1234-1234-1234-1234567890ab"}`
+`{"muse": {"alice": "12345678-1234-1234-1234-1234567890ab"}}`
 
 With that mapping the model `muse/alice` reaches that
-conversation, and `GET /v1/models` lists `muse/alice` next to the
-bare aliases. Names are matched case-insensitively; `main` is
-reserved. An unknown name gets a 400.
+conversation, and `GET /v1/models` lists `muse/alice` next to
+the bare aliases. Names are matched case-insensitively; `main`
+is reserved. An unknown name under a known Muse gets a 400,
+even when the name exists under another Muse.
 
-`SHIM_SESSION_PROMPTS` maps a session name to a custom prompt,
-as a JSON object. The prompt is prepended to the turn as a
-system line, ahead of the request's own messages and of the
-tools appendix. A prompt for a name with no session alias is a
-startup error, and the shim refuses to start.
+`SHIM_SESSION_PROMPTS` maps a Muse key to a session name to a
+custom prompt, as a nested JSON object. The prompt is prepended
+to the turn as a system line, ahead of the request's own
+messages and of the tools appendix. A prompt for a (Muse, name)
+with no session alias under that same Muse is a startup error,
+and the shim refuses to start.
 
 To find a session UUID, create a conversation in the Muse app
 and ask the Muse in that conversation for its session ID.

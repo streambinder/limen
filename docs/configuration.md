@@ -22,21 +22,22 @@ container health check tests for the gadget socket.
 
 ## Environment variables
 
-| Variable                | Default                           | Meaning                                                                                                         |
-| ----------------------- | --------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `MUSEGADGET_SOCKET`     | `/run/musegadget/musegadget.sock` | Unix socket of the gadget service                                                                               |
-| `SHIM_PORT`             | `8001`                            | Port of the shim HTTP server                                                                                    |
-| `SHIM_TIMEOUT_S`        | `1800`                            | Socket timeout for one turn                                                                                     |
-| `SHIM_MODEL_ALIASES`    | (none)                            | Comma-separated extra Muse aliases for the same Muse; fallback when discovery fails                             |
-| `SHIM_SESSION_ALIASES`  | (none)                            | JSON object mapping a session name to a session UUID; see [Session aliases](capabilities.md#session-aliases)    |
-| `SHIM_SESSION_PROMPTS`  | (none)                            | JSON object mapping a session name to its custom prompt; see [Session aliases](capabilities.md#session-aliases) |
-| `SHIM_DISCOVERY_WAIT_S` | `60`                              | Seconds to wait for the service at startup while learning the Muse name                                         |
-| `SHIM_REPLIES_DIR`      | `/workspace/replies`              | Reply drop directory                                                                                            |
-| `SHIM_REPLY_WAIT_S`     | `600`                             | Seconds to wait for a reply                                                                                     |
-| `SHIM_API_KEYS`         | (empty)                           | Comma-separated API keys                                                                                        |
-| `MUSEGADGET_SDK_TOKEN`  | (none)                            | SDK token, written to the state directory at start                                                              |
-| `MUSEGADGET_STATE_DIR`  | `/var/lib/musegadget`             | State directory                                                                                                 |
-| `MUSEGADGET_RUN_AS`     | `gadget`                          | Account that runs gadget commands                                                                               |
+| Variable                | Default                           | Meaning                                                                                                                                                  |
+| ----------------------- | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MUSEGADGET_SOCKET`     | `/run/musegadget/musegadget.sock` | Unix socket of the gadget service (the primary service)                                                                                                  |
+| `SHIM_GADGET_SOCKETS`   | (the default socket)              | Comma-separated sockets of all gadget services, primary first; unset means the default socket only. See [Multiple Muses](capabilities.md#multiple-muses) |
+| `SHIM_PORT`             | `8001`                            | Port of the shim HTTP server                                                                                                                             |
+| `SHIM_TIMEOUT_S`        | `1800`                            | Socket timeout for one turn                                                                                                                              |
+| `SHIM_MODEL_ALIASES`    | (none)                            | Comma-separated extra Muse aliases for the primary Muse only; fallback when discovery fails                                                              |
+| `SHIM_SESSION_ALIASES`  | (none)                            | Nested JSON object mapping a Muse key to a session name to a session UUID; see [Session aliases](capabilities.md#session-aliases)                        |
+| `SHIM_SESSION_PROMPTS`  | (none)                            | Nested JSON object mapping a Muse key to a session name to its custom prompt; see [Session aliases](capabilities.md#session-aliases)                     |
+| `SHIM_DISCOVERY_WAIT_S` | `60`                              | Seconds to wait for each service at startup while learning the Muse names                                                                                |
+| `SHIM_REPLIES_DIR`      | `/workspace/replies`              | Reply drop directory                                                                                                                                     |
+| `SHIM_REPLY_WAIT_S`     | `600`                             | Seconds to wait for a reply                                                                                                                              |
+| `SHIM_API_KEYS`         | (empty)                           | Comma-separated API keys                                                                                                                                 |
+| `MUSEGADGET_SDK_TOKEN`  | (none)                            | SDK token, written to the state directory at start                                                                                                       |
+| `MUSEGADGET_STATE_DIR`  | `/var/lib/musegadget`             | State directory                                                                                                                                          |
+| `MUSEGADGET_RUN_AS`     | `gadget`                          | Account that runs gadget commands                                                                                                                        |
 
 With no `SHIM_API_KEYS` set, the shim is open. Use that mode on
 trusted networks only. With keys set, every `/v1/*` request needs a
@@ -56,6 +57,17 @@ redeploy.
 For the official pairing guide, read the Linux SDK readme:
 <https://github.com/facebookincubator/muse-gadget-sdk/blob/main/linux/README.md>.
 Get an SDK token first. Every gadget needs one to pair.
+
+## Multiple Muses
+
+One shim serves several Muses, one gadget service per Muse.
+The main container runs the primary service and the shim, as
+above. Each extra Muse gets its own service-only container
+(entrypoint mode `service`) sharing a socket directory with
+the main container; `SHIM_GADGET_SOCKETS` on the main
+container lists every socket, primary first. Pairing a new
+gadget is a manual step from the Muse app: each gadget pairs
+with its own SDK token and its own state directory.
 
 ## Client configuration
 

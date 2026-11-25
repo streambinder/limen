@@ -291,16 +291,27 @@ struct SendTurn {
     image: Option<ImageInput>,
 }
 
+/// The parameters of one streaming tools request, bundled so the
+/// function stays under clippy's argument limit.
+struct ToolsOnceRequest<G> {
+    prompt: String,
+    session_id: Option<String>,
+    model: String,
+    image: Option<ImageInput>,
+    gadget: Arc<G>,
+}
+
 enum HybridOutcome {
     Done,
     Answered,
     Fallback,
 }
 
-/// The shim: configuration, gadget client and reply drop.
+/// The shim: configuration, gadget clients (one per Muse, in
+/// socket order) and reply drop.
 pub struct Shim<G: Gadget, R: ReplyWait> {
     pub config: Arc<Config>,
-    pub gadget: Arc<G>,
+    pub gadgets: Vec<Arc<G>>,
     pub replies: Arc<R>,
 }
 
@@ -310,19 +321,46 @@ impl<G: Gadget, R: ReplyWait> Clone for Shim<G, R> {
     fn clone(&self) -> Self {
         Shim {
             config: self.config.clone(),
-            gadget: self.gadget.clone(),
+            gadgets: self.gadgets.clone(),
             replies: self.replies.clone(),
         }
     }
 }
 
 impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
+    /// One gadget: the Muse list derives from the configured
+    /// aliases when startup did not fill it in (tests). Production
+    /// always runs startup first and uses `with_gadgets`.
     pub fn new(config: Config, gadget: Arc<G>, replies: Arc<R>) -> Self {
+        Self::with_gadgets(config, vec![gadget], replies)
+    }
+
+    pub fn with_gadgets(config: Config, gadgets: Vec<Arc<G>>, replies: Arc<R>) -> Self {
+        let mut config = config;
+        if config.muses.is_empty()
+            && let Some(first) = config.model_aliases.first()
+        {
+            config.muses = vec![crate::model::MuseInfo {
+                key: first.to_ascii_lowercase(),
+                aliases: config.model_aliases.clone(),
+                socket_path: config.gadget_sockets.first().cloned().unwrap_or_default(),
+            }];
+        }
         Shim {
             config: Arc::new(config),
-            gadget,
+            gadgets,
             replies,
         }
+    }
+
+    /// The gadget serving this Muse key; the first gadget when the
+    /// key is unknown (a resolved route always names a known Muse).
+    fn gadget_for(&self, muse_key: &str) -> Arc<G> {
+        let index = self.config.muse_index(muse_key).unwrap_or(0);
+        self.gadgets
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| self.gadgets[0].clone())
     }
 
     /// Dispatch on the raw request target, like the Python handler's
@@ -359,19 +397,25 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
         }
         json_response(
             StatusCode::OK,
-            &json!({"object": "list", "data": model_list(&self.config.model_aliases, self.config.context_window, &self.config.session_aliases)}),
+            &json!({"object": "list", "data": model_list(&self.config.muses, self.config.context_window, &self.config.session_aliases)}),
         )
     }
 
     fn get_healthz(&self) -> HttpResponse {
-        let ok = std::path::Path::new(&self.config.socket_path).exists();
+        let mut sockets = serde_json::Map::new();
+        let mut ok = true;
+        for muse in &self.config.muses {
+            let exists = std::path::Path::new(&muse.socket_path).exists();
+            ok &= exists;
+            sockets.insert(muse.key.clone(), Value::Bool(exists));
+        }
         json_response(
             if ok {
                 StatusCode::OK
             } else {
                 StatusCode::SERVICE_UNAVAILABLE
             },
-            &json!({"ok": ok, "socket": self.config.socket_path}),
+            &json!({"ok": ok, "sockets": sockets}),
         )
     }
 
@@ -479,7 +523,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
         let route = match resolve_model(
             &model,
             session_source.as_deref(),
-            &self.config.model_aliases,
+            &self.config.muses,
             &self.config.session_aliases,
         ) {
             Ok(route) => route,
@@ -495,12 +539,17 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
                 );
             }
         };
+        let gadget = self.gadget_for(&route.muse);
         let session_id = route.session_id;
         // A named session may carry its own prompt: it goes first,
         // as a system line, ahead of the request's own messages and
         // of the tools appendix.
         if let Some(name) = &route.session_alias
-            && let Some(custom) = self.config.session_prompts.get(name)
+            && let Some(custom) = self
+                .config
+                .session_prompts
+                .get(&route.muse)
+                .and_then(|names| names.get(name))
         {
             prompt = format!("system: {custom}\n\n{prompt}");
         }
@@ -524,21 +573,34 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
         if is_truthy(body.get("stream").unwrap_or(&Value::Null)) {
             if tools_on && wait {
                 return self
-                    .stream_tools_once(prompt, session_id, model, &tools, started, image)
+                    .stream_tools_once(
+                        ToolsOnceRequest {
+                            prompt,
+                            session_id,
+                            model,
+                            image,
+                            gadget,
+                        },
+                        &tools,
+                        started,
+                    )
                     .await;
             }
             return self
-                .stream_response(StreamRequest {
-                    prompt,
-                    forwarded,
-                    session_id,
-                    model,
-                    cid,
-                    wait,
-                    listen: listen_only,
-                    image,
-                    started,
-                })
+                .stream_response(
+                    StreamRequest {
+                        prompt,
+                        forwarded,
+                        session_id,
+                        model,
+                        cid,
+                        wait,
+                        listen: listen_only,
+                        image,
+                        started,
+                    },
+                    gadget.clone(),
+                )
                 .await;
         }
         let content = if wait {
@@ -549,6 +611,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
                     Some(std::cmp::min(self.config.reply_wait_s, MAX_WAIT_S)),
                     started,
                     image,
+                    gadget,
                 )
                 .await
             {
@@ -557,7 +620,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
             }
         } else {
             match self
-                .ask_turn_content(forwarded, session_id, None, started, image)
+                .ask_turn_content(forwarded, session_id, None, started, image, gadget)
                 .await
             {
                 Ok(content) => content,
@@ -590,8 +653,9 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
         wait_s: Option<u64>,
         started: Instant,
         image: Option<ImageInput>,
+        gadget: Arc<G>,
     ) -> Result<String, Box<HttpResponse>> {
-        let reply = self.gadget.ask(prompt, session_id, wait_s, image).await;
+        let reply = gadget.ask(prompt, session_id, wait_s, image).await;
         let elapsed = started.elapsed().as_secs_f32();
         let reply = match reply {
             Ok(reply) => reply,
@@ -634,13 +698,17 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
     /// so a tool turn never streams incrementally.
     async fn stream_tools_once(
         &self,
-        prompt: String,
-        session_id: Option<String>,
-        model: String,
+        request: ToolsOnceRequest<G>,
         tools: &[ToolDef],
         started: Instant,
-        image: Option<ImageInput>,
     ) -> HttpResponse {
+        let ToolsOnceRequest {
+            prompt,
+            session_id,
+            model,
+            image,
+            gadget,
+        } = request;
         let content = match self
             .ask_turn_content(
                 prompt,
@@ -648,6 +716,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
                 Some(std::cmp::min(self.config.reply_wait_s, MAX_WAIT_S)),
                 started,
                 image,
+                gadget,
             )
             .await
         {
@@ -701,11 +770,11 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
     /// Start the streaming flow in the background and answer from its
     /// first message: an SSE stream, or a 502 when it failed before
     /// any chunk.
-    async fn stream_response(&self, request: StreamRequest) -> HttpResponse {
+    async fn stream_response(&self, request: StreamRequest, gadget: Arc<G>) -> HttpResponse {
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamMsg>();
         let shim = self.clone();
         tokio::spawn(async move {
-            shim.run_stream_flow(request, tx).await;
+            shim.run_stream_flow(request, gadget, tx).await;
         });
         match rx.recv().await {
             Some(StreamMsg::Frame(first)) => {
@@ -735,7 +804,12 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
 
     /// The streaming flow: listen-only, hybrid, or legacy, then the
     /// reply-drop fallback. Emits SSE frames (or one failure) on `tx`.
-    async fn run_stream_flow(&self, request: StreamRequest, tx: mpsc::UnboundedSender<StreamMsg>) {
+    async fn run_stream_flow(
+        &self,
+        request: StreamRequest,
+        gadget: Arc<G>,
+        tx: mpsc::UnboundedSender<StreamMsg>,
+    ) {
         let StreamRequest {
             prompt,
             forwarded,
@@ -763,7 +837,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
         };
         let mut translator = StreamTranslator::with_follow(listen);
         if listen {
-            let rx = self.gadget.listen(session_id.as_deref(), None, None);
+            let rx = gadget.listen(session_id.as_deref(), None, None);
             let (result, error) = drain(rx, &mut translator, &mut sink, started).await;
             if drain_outcome(&result, error, &sink, &tx).await {
                 return;
@@ -779,6 +853,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
                         session_id: session_id.clone(),
                         image: image.clone(),
                     },
+                    gadget.clone(),
                     &mut translator,
                     &mut sink,
                     started,
@@ -797,9 +872,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
                 }
             }
         }
-        let rx = self
-            .gadget
-            .stream(&forwarded, session_id.as_deref(), image.as_ref());
+        let rx = gadget.stream(&forwarded, session_id.as_deref(), image.as_ref());
         let (result, error) = drain(rx, &mut translator, &mut sink, started).await;
         if drain_outcome(&result, error, &sink, &tx).await {
             return;
@@ -839,6 +912,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
     async fn stream_hybrid(
         &self,
         turn: SendTurn,
+        gadget: Arc<G>,
         translator: &mut StreamTranslator,
         sink: &mut SseSink,
         started: Instant,
@@ -853,7 +927,6 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
         let (stop_tx, stop_rx) = watch::channel(false);
         let slot: Arc<std::sync::Mutex<HybridSlot>> =
             Arc::new(std::sync::Mutex::new(HybridSlot::default()));
-        let gadget = self.gadget.clone();
         let prompt_owned = prompt;
         let session_owned = session_id.clone();
         let sender_session = session_owned.clone();
@@ -862,6 +935,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
         let ready_rx_sender = ready_rx;
         let stop_rx_sender = stop_rx.clone();
         let stop_tx_sender = stop_tx.clone();
+        let sender_gadget = gadget.clone();
         let sender = tokio::spawn(async move {
             // Wait for the subscription to open, polling every 100ms,
             // and give up without sending once the drain ends.
@@ -874,7 +948,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            let outcome = gadget
+            let outcome = sender_gadget
                 .ask(prompt_owned, sender_session, Some(wait_s), image)
                 .await;
             let mut slot = slot_sender.lock().unwrap();
@@ -884,9 +958,7 @@ impl<G: Gadget + 'static, R: ReplyWait + 'static> Shim<G, R> {
             }
             let _ = stop_tx_sender.send(true);
         });
-        let rx = self
-            .gadget
-            .listen(session_id.as_deref(), Some(ready_tx), Some(stop_rx));
+        let rx = gadget.listen(session_id.as_deref(), Some(ready_tx), Some(stop_rx));
         let (_result, error) = drain(rx, translator, sink, started).await;
         let _ = stop_tx.send(true);
         let _ = sender.await;
@@ -1322,8 +1394,11 @@ mod tests {
         let config = Config {
             model_aliases: vec!["muse".to_string()],
             session_aliases: std::collections::HashMap::from([(
-                "alice".to_string(),
-                "12345678-1234-1234-1234-1234567890ab".to_string(),
+                "muse".to_string(),
+                std::collections::HashMap::from([(
+                    "alice".to_string(),
+                    "12345678-1234-1234-1234-1234567890ab".to_string(),
+                )]),
             )]),
             ..config_open()
         };
@@ -1379,7 +1454,7 @@ mod tests {
         let sock = dir.join("present.sock");
         std::fs::write(&sock, "").unwrap();
         let config = Config {
-            socket_path: sock.to_string_lossy().to_string(),
+            gadget_sockets: vec![sock.to_string_lossy().to_string()],
             ..config_open()
         };
         let gadget = Arc::new(FakeGadget::new());
@@ -1388,10 +1463,10 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(
             json_body(&raw),
-            json!({"ok": true, "socket": sock.to_string_lossy()})
+            json!({"ok": true, "sockets": {"muse": true}})
         );
         let config = Config {
-            socket_path: dir.join("absent.sock").to_string_lossy().to_string(),
+            gadget_sockets: vec![dir.join("absent.sock").to_string_lossy().to_string()],
             ..config_open()
         };
         let server = serve_with(
@@ -1402,7 +1477,236 @@ mod tests {
         .await;
         let (status, _, raw) = http_request(server.port, "GET", "/healthz", None, &[]).await;
         assert_eq!(status, 503);
-        assert_eq!(json_body(&raw)["ok"], false);
+        assert_eq!(
+            json_body(&raw),
+            json!({"ok": false, "sockets": {"muse": false}})
+        );
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_each_socket() {
+        let dir = std::env::temp_dir().join(format!("limen-shim-healthz2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("present.sock");
+        std::fs::write(&present, "").unwrap();
+        let absent = dir.join("absent.sock");
+        let mut config = two_muse_config();
+        config.muses[0].socket_path = present.to_string_lossy().to_string();
+        config.muses[1].socket_path = absent.to_string_lossy().to_string();
+        config.gadget_sockets = vec![
+            present.to_string_lossy().to_string(),
+            absent.to_string_lossy().to_string(),
+        ];
+        let server = serve_with_muses(
+            config,
+            vec![Arc::new(FakeGadget::new()), Arc::new(FakeGadget::new())],
+            Arc::new(FakeReplyWait::new()),
+        )
+        .await;
+        let (status, _, raw) = http_request(server.port, "GET", "/healthz", None, &[]).await;
+        assert_eq!(status, 503);
+        assert_eq!(
+            json_body(&raw),
+            json!({"ok": false, "sockets": {"muse": true, "other": false}})
+        );
+    }
+
+    /// Two Muses with the same session name "alice" under different
+    /// UUIDs, as startup would register them.
+    fn two_muse_config() -> Config {
+        Config {
+            gadget_sockets: vec![
+                "/run/musegadget/musegadget.sock".to_string(),
+                "/run/other/musegadget.sock".to_string(),
+            ],
+            muses: vec![
+                crate::model::MuseInfo {
+                    key: "muse".to_string(),
+                    aliases: vec!["muse".to_string()],
+                    socket_path: "/run/musegadget/musegadget.sock".to_string(),
+                },
+                crate::model::MuseInfo {
+                    key: "other".to_string(),
+                    aliases: vec!["other".to_string()],
+                    socket_path: "/run/other/musegadget.sock".to_string(),
+                },
+            ],
+            session_aliases: std::collections::HashMap::from([
+                (
+                    "muse".to_string(),
+                    std::collections::HashMap::from([(
+                        "alice".to_string(),
+                        "12345678-1234-1234-1234-1234567890ab".to_string(),
+                    )]),
+                ),
+                (
+                    "other".to_string(),
+                    std::collections::HashMap::from([(
+                        "alice".to_string(),
+                        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                    )]),
+                ),
+            ]),
+            ..config_open()
+        }
+    }
+
+    async fn serve_with_muses<G: Gadget + 'static, R: ReplyWait + 'static>(
+        config: Config,
+        gadgets: Vec<Arc<G>>,
+        replies: Arc<R>,
+    ) -> TestServer<G, R> {
+        let shim = Shim::with_gadgets(config, gadgets, replies);
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        let port = bind_and_serve(shim.clone(), addr).await.unwrap().port();
+        TestServer { port, shim }
+    }
+
+    #[tokio::test]
+    async fn get_models_lists_per_muse_session_aliases() {
+        let server = serve_with_muses(
+            two_muse_config(),
+            vec![Arc::new(FakeGadget::new()), Arc::new(FakeGadget::new())],
+            Arc::new(FakeReplyWait::new()),
+        )
+        .await;
+        let (status, _, raw) = http_request(server.port, "GET", "/v1/models", None, &[]).await;
+        assert_eq!(status, 200);
+        let body = json_body(&raw);
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["muse", "muse/alice", "other", "other/alice"]);
+    }
+
+    #[tokio::test]
+    async fn post_named_session_routes_to_its_own_muse() {
+        let first = gadget_with_reply(json!({"ok": true, "reply": "from muse", "response": "r"}));
+        let second = gadget_with_reply(json!({"ok": true, "reply": "from other", "response": "r"}));
+        let server = serve_with_muses(
+            two_muse_config(),
+            vec![first.clone(), second.clone()],
+            Arc::new(FakeReplyWait::new()),
+        )
+        .await;
+        let (status, _, raw) = post(
+            server.port,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "other/alice"}"#,
+            &[],
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            json_body(&raw)["choices"][0]["message"]["content"],
+            "from other"
+        );
+        assert!(first.ask_calls.lock().unwrap().is_empty());
+        let session = {
+            let calls = second.ask_calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            calls[0].1.clone()
+        };
+        assert_eq!(
+            session,
+            Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string())
+        );
+        let (status, _, raw) = post(
+            server.port,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "muse/alice"}"#,
+            &[],
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            json_body(&raw)["choices"][0]["message"]["content"],
+            "from muse"
+        );
+        let calls = first.ask_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1,
+            Some("12345678-1234-1234-1234-1234567890ab".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn post_unknown_muse_is_404_even_when_name_exists() {
+        let first = Arc::new(FakeGadget::new());
+        let second = Arc::new(FakeGadget::new());
+        let server = serve_with_muses(
+            two_muse_config(),
+            vec![first.clone(), second.clone()],
+            Arc::new(FakeReplyWait::new()),
+        )
+        .await;
+        let (status, _, raw) = post(
+            server.port,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "nope/alice"}"#,
+            &[],
+        )
+        .await;
+        assert_eq!(status, 404);
+        assert_eq!(json_body(&raw)["error"]["code"], "model_not_found");
+        assert!(first.ask_calls.lock().unwrap().is_empty());
+        assert!(second.ask_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_unknown_name_under_known_muse_is_400() {
+        // "bob" exists under other only; muse/bob is a 400.
+        let mut config = two_muse_config();
+        config.session_aliases.get_mut("other").unwrap().insert(
+            "bob".to_string(),
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+        );
+        let server = serve_with_muses(
+            config,
+            vec![Arc::new(FakeGadget::new()), Arc::new(FakeGadget::new())],
+            Arc::new(FakeReplyWait::new()),
+        )
+        .await;
+        let (status, _, raw) = post(
+            server.port,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "muse/bob"}"#,
+            &[],
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert_eq!(json_body(&raw)["error"]["code"], "invalid_model");
+    }
+
+    #[tokio::test]
+    async fn post_session_prompt_is_per_muse() {
+        let mut config = two_muse_config();
+        config.session_prompts = std::collections::HashMap::from([(
+            "other".to_string(),
+            std::collections::HashMap::from([(
+                "alice".to_string(),
+                "You are talking to Other Alice.".to_string(),
+            )]),
+        )]);
+        let second = gadget_with_reply(json!({"ok": true, "reply": "hi", "response": "r"}));
+        let server = serve_with_muses(
+            config,
+            vec![Arc::new(FakeGadget::new()), second.clone()],
+            Arc::new(FakeReplyWait::new()),
+        )
+        .await;
+        let (status, _, _) = post(
+            server.port,
+            r#"{"messages": [{"role": "user", "content": "hi"}], "model": "other/alice"}"#,
+            &[],
+        )
+        .await;
+        assert_eq!(status, 200);
+        let prompt = second.ask_calls.lock().unwrap()[0].0.clone();
+        assert!(
+            prompt.starts_with("system: You are talking to Other Alice.\n\nuser: hi"),
+            "{prompt}"
+        );
     }
 
     #[tokio::test]
@@ -1791,12 +2095,18 @@ mod tests {
     async fn post_completion_prepends_session_prompt() {
         let config = Config {
             session_aliases: std::collections::HashMap::from([(
-                "alice".to_string(),
-                "12345678-1234-1234-1234-1234567890ab".to_string(),
+                "muse".to_string(),
+                std::collections::HashMap::from([(
+                    "alice".to_string(),
+                    "12345678-1234-1234-1234-1234567890ab".to_string(),
+                )]),
             )]),
             session_prompts: std::collections::HashMap::from([(
-                "alice".to_string(),
-                "You are talking to Alice, who likes short answers.".to_string(),
+                "muse".to_string(),
+                std::collections::HashMap::from([(
+                    "alice".to_string(),
+                    "You are talking to Alice, who likes short answers.".to_string(),
+                )]),
             )]),
             ..config_open()
         };

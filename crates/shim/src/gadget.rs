@@ -17,7 +17,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 use tokio::time;
 
-use crate::config::{Config, log};
+use crate::config::log;
 use crate::image::ImageInput;
 use crate::json::{is_truthy, py_str, python_dumps};
 
@@ -239,10 +239,10 @@ pub struct UnixGadget {
 }
 
 impl UnixGadget {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(socket_path: String, timeout: Duration) -> Self {
         UnixGadget {
-            socket_path: config.socket_path.clone(),
-            timeout: config.timeout,
+            socket_path,
+            timeout,
         }
     }
 }

@@ -8,7 +8,7 @@ use std::env;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::model::is_uuid;
+use crate::model::{MuseInfo, is_uuid};
 
 pub const DEFAULT_SOCKET_PATH: &str = "/run/musegadget/musegadget.sock";
 pub const DEFAULT_PORT: u16 = 8001;
@@ -26,14 +26,25 @@ pub const DEFAULT_REPLY_POLL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub socket_path: String,
+    /// All gadget sockets, in order; the first socket's Muse is the
+    /// primary. Unset `SHIM_GADGET_SOCKETS` means exactly one socket:
+    /// `MUSEGADGET_SOCKET` (or its default).
+    pub gadget_sockets: Vec<String>,
     pub port: u16,
     pub timeout: Duration,
+    /// Extra Muse aliases for the PRIMARY Muse only (the first
+    /// socket's Muse); additional Muses are addressed by their
+    /// discovered name only.
     pub model_aliases: Vec<String>,
-    /// Named sessions: lowercase name to session UUID.
-    pub session_aliases: HashMap<String, String>,
-    /// Custom prompt per named session, keyed by lowercase name.
-    pub session_prompts: HashMap<String, String>,
+    /// Named sessions, per Muse: lowercase Muse key to lowercase
+    /// name to session UUID.
+    pub session_aliases: HashMap<String, HashMap<String, String>>,
+    /// Custom prompt per named session, per Muse: lowercase Muse
+    /// key to lowercase name to prompt.
+    pub session_prompts: HashMap<String, HashMap<String, String>>,
+    /// One entry per socket, in socket order; filled in by startup
+    /// (discovery). Empty before startup.
+    pub muses: Vec<MuseInfo>,
     pub context_window: u64,
     pub discovery_wait: Duration,
     pub discovery_poll: Duration,
@@ -46,12 +57,13 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            socket_path: DEFAULT_SOCKET_PATH.to_string(),
+            gadget_sockets: vec![DEFAULT_SOCKET_PATH.to_string()],
             port: DEFAULT_PORT,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_S),
             model_aliases: Vec::new(),
             session_aliases: HashMap::new(),
             session_prompts: HashMap::new(),
+            muses: Vec::new(),
             context_window: DEFAULT_CONTEXT_WINDOW,
             discovery_wait: Duration::from_secs(DEFAULT_DISCOVERY_WAIT_S),
             discovery_poll: DEFAULT_DISCOVERY_POLL,
@@ -60,6 +72,14 @@ impl Default for Config {
             reply_poll: DEFAULT_REPLY_POLL,
             api_keys: Vec::new(),
         }
+    }
+}
+
+impl Config {
+    /// The index of the Muse with this key (lowercase discovered
+    /// name), if the startup discovery registered it.
+    pub fn muse_index(&self, key: &str) -> Option<usize> {
+        self.muses.iter().position(|muse| muse.key == key)
     }
 }
 
@@ -95,65 +115,127 @@ fn env_list(name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Parse `SHIM_SESSION_ALIASES`: a JSON object mapping a session
-/// name to a session UUID, for example
-/// `{"alice": "12345678-1234-1234-1234-1234567890ab"}`. Names are
-/// matched case-insensitively; `main` is reserved and rejected.
-pub fn parse_session_aliases(raw: &str) -> Result<HashMap<String, String>, String> {
+/// Resolve the gadget socket list: `SHIM_GADGET_SOCKETS` when set
+/// is the full list; unset or empty means exactly one socket, the
+/// default socket. Empty entries are dropped; a duplicate socket
+/// path is an error.
+pub fn resolve_gadget_sockets(
+    sockets_env: &str,
+    default_socket: &str,
+) -> Result<Vec<String>, String> {
+    let list: Vec<String> = sockets_env
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect();
+    let list = if list.is_empty() {
+        vec![default_socket.to_string()]
+    } else {
+        list
+    };
+    let mut seen = std::collections::HashSet::new();
+    for socket in &list {
+        if !seen.insert(socket.clone()) {
+            return Err(format!("SHIM_GADGET_SOCKETS lists {socket:?} twice"));
+        }
+    }
+    Ok(list)
+}
+
+/// Validate one session name, as today: lowercased, no `/` or
+/// whitespace, `main` reserved.
+fn valid_session_name(name: &str) -> Result<String, String> {
+    let name = name.trim().to_ascii_lowercase();
+    if name.is_empty() || name.contains('/') || name.contains(char::is_whitespace) {
+        return Err(format!("invalid session name {name:?}"));
+    }
+    if name == "main" {
+        return Err("session name \"main\" is reserved".to_string());
+    }
+    Ok(name)
+}
+
+/// Parse `SHIM_SESSION_ALIASES`: a nested JSON object mapping a
+/// Muse key to a session name to a session UUID, for example
+/// `{"muse": {"alice": "12345678-1234-1234-1234-1234567890ab"}}`.
+/// Muse keys and session names are matched case-insensitively; the
+/// same session name may appear under different Muses.
+pub fn parse_session_aliases(
+    raw: &str,
+) -> Result<HashMap<String, HashMap<String, String>>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(HashMap::new());
     }
-    let parsed: HashMap<String, String> = serde_json::from_str(trimmed)
+    let parsed: HashMap<String, HashMap<String, String>> = serde_json::from_str(trimmed)
         .map_err(|err| format!("SHIM_SESSION_ALIASES is not a JSON object: {err}"))?;
-    let mut out = HashMap::new();
-    for (name, uuid) in parsed {
-        let name = name.trim().to_ascii_lowercase();
-        if name.is_empty() || name.contains('/') || name.contains(char::is_whitespace) {
-            return Err(format!(
-                "SHIM_SESSION_ALIASES has an invalid session name {name:?}"
-            ));
+    let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for (muse, names) in parsed {
+        let muse = muse.trim().to_ascii_lowercase();
+        if muse.is_empty() {
+            return Err("SHIM_SESSION_ALIASES has an empty Muse key".to_string());
         }
-        if name == "main" {
-            return Err("SHIM_SESSION_ALIASES must not define \"main\"".to_string());
+        let mut per_muse = HashMap::new();
+        for (name, uuid) in names {
+            let name = valid_session_name(&name)
+                .map_err(|err| format!("SHIM_SESSION_ALIASES[{muse}] {err}"))?;
+            let uuid = uuid.trim().to_ascii_lowercase();
+            if !is_uuid(&uuid) {
+                return Err(format!(
+                    "SHIM_SESSION_ALIASES[{muse}][{name}] is not a UUID: {uuid:?}"
+                ));
+            }
+            if per_muse.insert(name.clone(), uuid).is_some() {
+                return Err(format!(
+                    "SHIM_SESSION_ALIASES[{muse}] defines {name:?} twice"
+                ));
+            }
         }
-        let uuid = uuid.trim().to_ascii_lowercase();
-        if !is_uuid(&uuid) {
-            return Err(format!(
-                "SHIM_SESSION_ALIASES[{name}] is not a UUID: {uuid:?}"
-            ));
-        }
-        if out.insert(name.clone(), uuid).is_some() {
-            return Err(format!("SHIM_SESSION_ALIASES defines {name:?} twice"));
+        if out.insert(muse.clone(), per_muse).is_some() {
+            return Err(format!("SHIM_SESSION_ALIASES defines Muse {muse:?} twice"));
         }
     }
     Ok(out)
 }
 
-/// Parse `SHIM_SESSION_PROMPTS`: a JSON object mapping a session
-/// name to its custom prompt. Every name must have a session alias;
-/// prompts are empty when unset.
+/// Parse `SHIM_SESSION_PROMPTS`: a nested JSON object mapping a
+/// Muse key to a session name to its custom prompt. Every (Muse,
+/// name) must have a session alias under the SAME Muse; prompts
+/// are empty when unset.
 pub fn parse_session_prompts(
     raw: &str,
-    aliases: &HashMap<String, String>,
-) -> Result<HashMap<String, String>, String> {
+    aliases: &HashMap<String, HashMap<String, String>>,
+) -> Result<HashMap<String, HashMap<String, String>>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(HashMap::new());
     }
-    let parsed: HashMap<String, String> = serde_json::from_str(trimmed)
+    let parsed: HashMap<String, HashMap<String, String>> = serde_json::from_str(trimmed)
         .map_err(|err| format!("SHIM_SESSION_PROMPTS is not a JSON object: {err}"))?;
-    let mut out = HashMap::new();
-    for (name, prompt) in parsed {
-        let name = name.trim().to_ascii_lowercase();
-        if !aliases.contains_key(&name) {
-            return Err(format!("SHIM_SESSION_PROMPTS[{name}] has no session alias"));
+    let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for (muse, names) in parsed {
+        let muse = muse.trim().to_ascii_lowercase();
+        let Some(muse_aliases) = aliases.get(&muse) else {
+            return Err(format!(
+                "SHIM_SESSION_PROMPTS[{muse}] has no session aliases"
+            ));
+        };
+        let mut per_muse = HashMap::new();
+        for (name, prompt) in names {
+            let name = name.trim().to_ascii_lowercase();
+            if !muse_aliases.contains_key(&name) {
+                return Err(format!(
+                    "SHIM_SESSION_PROMPTS[{muse}][{name}] has no session alias"
+                ));
+            }
+            let prompt = prompt.trim().to_string();
+            if prompt.is_empty() {
+                return Err(format!("SHIM_SESSION_PROMPTS[{muse}][{name}] is empty"));
+            }
+            per_muse.insert(name, prompt);
         }
-        let prompt = prompt.trim().to_string();
-        if prompt.is_empty() {
-            return Err(format!("SHIM_SESSION_PROMPTS[{name}] is empty"));
-        }
-        out.insert(name, prompt);
+        out.insert(muse, per_muse);
     }
     Ok(out)
 }
@@ -168,14 +250,20 @@ impl Config {
             &env::var("SHIM_SESSION_PROMPTS").unwrap_or_default(),
             &session_aliases,
         )?;
+        let default_socket =
+            env::var("MUSEGADGET_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
+        let gadget_sockets = resolve_gadget_sockets(
+            &env::var("SHIM_GADGET_SOCKETS").unwrap_or_default(),
+            &default_socket,
+        )?;
         Ok(Config {
-            socket_path: env::var("MUSEGADGET_SOCKET")
-                .unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string()),
+            gadget_sockets,
             port: env_u16("SHIM_PORT", DEFAULT_PORT)?,
             timeout: Duration::from_secs(env_u64("SHIM_TIMEOUT_S", DEFAULT_TIMEOUT_S)?),
             model_aliases: env_list("SHIM_MODEL_ALIASES"),
             session_aliases,
             session_prompts,
+            muses: Vec::new(),
             context_window: env_u64("SHIM_CONTEXT_WINDOW", DEFAULT_CONTEXT_WINDOW)?,
             discovery_wait: Duration::from_secs(env_u64(
                 "SHIM_DISCOVERY_WAIT_S",
@@ -194,7 +282,7 @@ impl Config {
     /// A config for tests: one alias, no keys, tiny waits.
     pub fn test_default() -> Config {
         Config {
-            socket_path: "/nonexistent/gadget.sock".to_string(),
+            gadget_sockets: vec!["/nonexistent/gadget.sock".to_string()],
             port: 0,
             model_aliases: vec!["muse".to_string()],
             discovery_wait: Duration::from_secs(0),
@@ -234,7 +322,10 @@ mod tests {
     #[test]
     fn defaults_match_python() {
         let config = Config::default();
-        assert_eq!(config.socket_path, "/run/musegadget/musegadget.sock");
+        assert_eq!(
+            config.gadget_sockets,
+            vec!["/run/musegadget/musegadget.sock".to_string()]
+        );
         assert_eq!(config.port, 8001);
         assert_eq!(config.timeout, Duration::from_secs(1800));
         assert_eq!(config.discovery_wait, Duration::from_secs(60));
@@ -243,6 +334,28 @@ mod tests {
         assert_eq!(MAX_WAIT_S, 600);
         assert!(config.session_aliases.is_empty());
         assert!(config.session_prompts.is_empty());
+        assert!(config.muses.is_empty());
+    }
+
+    #[test]
+    fn resolve_gadget_sockets_cases() {
+        assert_eq!(
+            resolve_gadget_sockets("", "/run/musegadget/musegadget.sock").unwrap(),
+            vec!["/run/musegadget/musegadget.sock".to_string()]
+        );
+        assert_eq!(
+            resolve_gadget_sockets("  , ", "/run/musegadget/musegadget.sock").unwrap(),
+            vec!["/run/musegadget/musegadget.sock".to_string()]
+        );
+        assert_eq!(
+            resolve_gadget_sockets("/a.sock, /b.sock ", "/run/musegadget/musegadget.sock").unwrap(),
+            vec!["/a.sock".to_string(), "/b.sock".to_string()]
+        );
+        assert!(
+            resolve_gadget_sockets("/a.sock,/a.sock", "/run/musegadget/musegadget.sock")
+                .unwrap_err()
+                .contains("twice")
+        );
     }
 
     #[test]
@@ -250,53 +363,74 @@ mod tests {
         assert!(parse_session_aliases("").unwrap().is_empty());
         assert!(parse_session_aliases("  ").unwrap().is_empty());
         let one =
-            parse_session_aliases(r#"{"Alice": "12345678-1234-1234-1234-1234567890AB"}"#).unwrap();
+            parse_session_aliases(r#"{"Muse": {"Alice": "12345678-1234-1234-1234-1234567890AB"}}"#)
+                .unwrap();
         assert_eq!(
-            one.get("alice"),
+            one.get("muse").and_then(|names| names.get("alice")),
             Some(&"12345678-1234-1234-1234-1234567890ab".to_string())
         );
+        // The same name under two Muses is fine: that is the point.
+        let two = parse_session_aliases(
+            r#"{"muse": {"alice": "12345678-1234-1234-1234-1234567890ab"}, "other": {"alice": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}"#,
+        )
+        .unwrap();
+        assert_eq!(two.len(), 2);
         assert!(parse_session_aliases("not json").is_err());
         assert!(parse_session_aliases(r#"["alice"]"#).is_err());
         assert!(
-            parse_session_aliases(r#"{"alice": "not-a-uuid"}"#)
+            parse_session_aliases(r#"{"muse": {"alice": "not-a-uuid"}}"#)
                 .unwrap_err()
                 .contains("is not a UUID")
         );
         assert!(
-            parse_session_aliases(r#"{"main": "12345678-1234-1234-1234-1234567890ab"}"#)
+            parse_session_aliases(r#"{"muse": {"main": "12345678-1234-1234-1234-1234567890ab"}}"#)
                 .unwrap_err()
-                .contains("must not define")
+                .contains("reserved")
         );
         assert!(
-            parse_session_aliases(r#"{"a/b": "12345678-1234-1234-1234-1234567890ab"}"#).is_err()
+            parse_session_aliases(r#"{"muse": {"a/b": "12345678-1234-1234-1234-1234567890ab"}}"#)
+                .is_err()
         );
-        assert!(
-            parse_session_aliases(
-                r#"{"Alice": "12345678-1234-1234-1234-1234567890ab", "alice": "12345678-1234-1234-1234-1234567890ab"}"#
-            )
-            .unwrap_err()
-            .contains("twice")
-        );
+        assert!(parse_session_aliases(
+            r#"{"Muse": {"alice": "12345678-1234-1234-1234-1234567890ab"}, "muse": {"alice": "12345678-1234-1234-1234-1234567890ab"}}"#
+        )
+        .unwrap_err()
+        .contains("twice"));
+        assert!(parse_session_aliases(
+            r#"{"muse": {"Alice": "12345678-1234-1234-1234-1234567890ab", "alice": "12345678-1234-1234-1234-1234567890ab"}}"#
+        )
+        .unwrap_err()
+        .contains("twice"));
     }
 
     #[test]
     fn parse_session_prompts_cases() {
         let aliases =
-            parse_session_aliases(r#"{"alice": "12345678-1234-1234-1234-1234567890ab"}"#).unwrap();
+            parse_session_aliases(r#"{"muse": {"alice": "12345678-1234-1234-1234-1234567890ab"}}"#)
+                .unwrap();
         assert!(parse_session_prompts("", &aliases).unwrap().is_empty());
-        let one = parse_session_prompts(r#"{"Alice": "  You are talking to Alice.  "}"#, &aliases)
-            .unwrap();
+        let one = parse_session_prompts(
+            r#"{"Muse": {"Alice": "  You are talking to Alice.  "}}"#,
+            &aliases,
+        )
+        .unwrap();
         assert_eq!(
-            one.get("alice"),
+            one.get("muse").and_then(|names| names.get("alice")),
             Some(&"You are talking to Alice.".to_string())
         );
+        // A prompt under another Muse needs the alias under THAT Muse.
         assert!(
-            parse_session_prompts(r#"{"bob": "hi"}"#, &aliases)
+            parse_session_prompts(r#"{"other": {"alice": "hi"}}"#, &aliases)
+                .unwrap_err()
+                .contains("has no session aliases")
+        );
+        assert!(
+            parse_session_prompts(r#"{"muse": {"bob": "hi"}}"#, &aliases)
                 .unwrap_err()
                 .contains("has no session alias")
         );
         assert!(
-            parse_session_prompts(r#"{"alice": "  "}"#, &aliases)
+            parse_session_prompts(r#"{"muse": {"alice": "  "}}"#, &aliases)
                 .unwrap_err()
                 .contains("is empty")
         );
