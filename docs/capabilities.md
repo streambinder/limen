@@ -59,8 +59,7 @@ and 503 when it does not. The health endpoint needs no key.
 
 ## Tool calling
 
-The gadget channel carries text turns only, so the Muse cannot
-emit native tool calls. The shim implements OpenAI function
+The Muse cannot emit native tool calls. The shim implements OpenAI function
 calling by prompt injection: it appends the `tools` schemas to
 the prompt and asks the Muse to answer with a
 `{"tool_calls": [...]}` JSON object when it wants a tool. A reply
@@ -76,6 +75,29 @@ name. `tool_choice: "none"` skips the injection; a
 that tool. A streaming request with tools is answered as one
 buffered SSE chunk plus `[DONE]`, never as live deltas: the
 tool_calls JSON would otherwise leak out as text first.
+
+## Image input
+
+A completion request may carry one image in the latest user
+message, as an `image_url` content part. The shim forwards it
+with the turn, so the Muse sees the image and can analyse it.
+Video and audio input are not supported.
+
+Rules, enforced by the shim before the turn is sent:
+
+- The URL must be a base64 data URL (`data:image/...;base64,...`).
+  Remote URLs are rejected: the client sends the bytes.
+- The format must be JPEG, PNG, GIF or WebP.
+- The decoded image must be 2 MiB or less.
+- One image per request. A second image in the same message is
+  a 400; images in earlier messages are not sent again, because
+  the session already holds them.
+- An image with no text still works: the shim sends the turn with
+  the minimal text `Image uploaded`, because the service needs
+  non-empty text.
+
+A request that breaks a rule gets a 400 with the reason in the
+error message. The `detail` field, when present, is ignored.
 
 ## Model addressing
 

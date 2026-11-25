@@ -212,6 +212,30 @@ class Service:
             writer.write(json.dumps(reply).encode() + b"\\n")
             await writer.drain()
             return
+        image = request.get("image")
+        if image is not None:
+            if not (isinstance(image, dict)
+                    and isinstance(image.get("mime_type"), str)
+                    and isinstance(image.get("data_base64"), str)
+                    and isinstance(image.get("filename", ""), str)):
+                reply = {"ok": False, "error": "image must be {mime_type, data_base64, filename}"}
+                writer.write(json.dumps(reply).encode() + b"\\n")
+                await writer.drain()
+                return
+            try:
+                image_bytes = base64.b64decode(image["data_base64"], validate=True)
+            except ValueError:
+                reply = {"ok": False, "error": "image data_base64 is not valid base64"}
+                writer.write(json.dumps(reply).encode() + b"\\n")
+                await writer.drain()
+                return
+            try:
+                check_image(image_bytes, image["mime_type"])
+            except ValueError as exc:
+                reply = {"ok": False, "error": str(exc)}
+                writer.write(json.dumps(reply).encode() + b"\\n")
+                await writer.drain()
+                return
         session = self._current
         if session is None or session.registered_at is None:
             reply = {"ok": False, "error": "not connected to the Muse"}
@@ -251,7 +275,12 @@ class Service:
         try:
             post = None
             if not listen:
-                post = asyncio.ensure_future(session.send_chat(message, session_id))
+                if image is not None:
+                    post = asyncio.ensure_future(session.send_image(
+                        image_bytes, image["mime_type"], session_id,
+                        message=message, filename=image.get("filename") or None))
+                else:
+                    post = asyncio.ensure_future(session.send_chat(message, session_id))
             deadline = time.monotonic() + STREAM_WAIT_S
             last_event = time.monotonic()
             done = False

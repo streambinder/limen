@@ -1,6 +1,7 @@
 pub mod config;
 pub mod gadget;
 pub mod http;
+pub mod image;
 pub mod json;
 pub mod model;
 pub mod prompt;

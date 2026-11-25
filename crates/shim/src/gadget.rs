@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time;
 
 use crate::config::{Config, log};
+use crate::image::ImageInput;
 use crate::json::{is_truthy, py_str, python_dumps};
 
 #[derive(Debug)]
@@ -59,11 +60,13 @@ pub trait Gadget: Send + Sync {
 
     /// Send a turn; `wait_s` asks the service to wait for the
     /// finished reply. The session is omitted for the main chat.
+    /// `image` rides in the socket `image` field when present.
     fn ask(
         &self,
         prompt: String,
         session_id: Option<String>,
         wait_s: Option<u64>,
+        image: Option<ImageInput>,
     ) -> impl std::future::Future<Output = Result<Value, GadgetError>> + Send + '_ {
         async move {
             let mut payload = serde_json::Map::new();
@@ -73,6 +76,16 @@ pub trait Gadget: Send + Sync {
             }
             if let Some(wait_s) = wait_s {
                 payload.insert("wait".to_string(), json!(wait_s));
+            }
+            if let Some(image) = image {
+                payload.insert(
+                    "image".to_string(),
+                    json!({
+                        "mime_type": image.mime_type,
+                        "data_base64": image.data_base64,
+                        "filename": image.filename,
+                    }),
+                );
             }
             self.raw(Value::Object(payload)).await
         }
@@ -93,6 +106,7 @@ pub trait Gadget: Send + Sync {
         &self,
         prompt: &str,
         session_id: Option<&str>,
+        image: Option<&ImageInput>,
     ) -> mpsc::UnboundedReceiver<Result<SocketItem, GadgetError>>;
 }
 
@@ -264,6 +278,7 @@ impl Gadget for UnixGadget {
         &self,
         prompt: &str,
         session_id: Option<&str>,
+        image: Option<&ImageInput>,
     ) -> mpsc::UnboundedReceiver<Result<SocketItem, GadgetError>> {
         let mut payload = serde_json::Map::new();
         payload.insert("message".to_string(), Value::String(prompt.to_string()));
@@ -272,6 +287,16 @@ impl Gadget for UnixGadget {
             payload.insert(
                 "session_id".to_string(),
                 Value::String(session_id.to_string()),
+            );
+        }
+        if let Some(image) = image {
+            payload.insert(
+                "image".to_string(),
+                json!({
+                    "mime_type": image.mime_type,
+                    "data_base64": image.data_base64,
+                    "filename": image.filename,
+                }),
             );
         }
         let mut bytes = python_dumps(&Value::Object(payload)).into_bytes();
@@ -345,8 +370,11 @@ pub mod fake {
         GadgetError::Io(io::Error::other(msg.to_string()))
     }
 
-    /// One recorded `ask` call: (prompt, session id, wait seconds).
-    pub type AskCall = (String, Option<String>, Option<u64>);
+    /// One recorded `ask` call: (prompt, session id, wait seconds, image).
+    pub type AskCall = (String, Option<String>, Option<u64>, Option<ImageInput>);
+
+    /// One recorded `stream` call: (prompt, session id, image).
+    pub type StreamCall = (String, Option<String>, Option<ImageInput>);
 
     pub struct FakeGadget {
         pub raw_replies: Mutex<VecDeque<Result<Value, GadgetError>>>,
@@ -357,7 +385,7 @@ pub mod fake {
         pub listen_calls: Mutex<Vec<Option<String>>>,
         pub listen_sets_ready: bool,
         pub stream_items: Mutex<VecDeque<Result<SocketItem, GadgetError>>>,
-        pub stream_calls: Mutex<Vec<(String, Option<String>)>>,
+        pub stream_calls: Mutex<Vec<StreamCall>>,
     }
 
     impl FakeGadget {
@@ -412,11 +440,12 @@ pub mod fake {
             prompt: String,
             session_id: Option<String>,
             wait_s: Option<u64>,
+            image: Option<ImageInput>,
         ) -> Result<Value, GadgetError> {
             self.ask_calls
                 .lock()
                 .unwrap()
-                .push((prompt, session_id, wait_s));
+                .push((prompt, session_id, wait_s, image));
             self.ask_replies
                 .lock()
                 .unwrap()
@@ -454,11 +483,13 @@ pub mod fake {
             &self,
             prompt: &str,
             session_id: Option<&str>,
+            image: Option<&ImageInput>,
         ) -> mpsc::UnboundedReceiver<Result<SocketItem, GadgetError>> {
-            self.stream_calls
-                .lock()
-                .unwrap()
-                .push((prompt.to_string(), session_id.map(str::to_string)));
+            self.stream_calls.lock().unwrap().push((
+                prompt.to_string(),
+                session_id.map(str::to_string),
+                image.cloned(),
+            ));
             let (tx, rx) = mpsc::unbounded_channel();
             let items: Vec<_> = self.stream_items.lock().unwrap().drain(..).collect();
             tokio::spawn(async move {
@@ -537,7 +568,12 @@ mod tests {
             timeout: StdDuration::from_secs(5),
         };
         let reply = gadget
-            .ask("prompt text".to_string(), Some("sess-1".to_string()), None)
+            .ask(
+                "prompt text".to_string(),
+                Some("sess-1".to_string()),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(reply, json!({"ok": true, "response": "hi"}));
@@ -563,6 +599,7 @@ mod tests {
                 "prompt text".to_string(),
                 Some("sess-1".to_string()),
                 Some(120),
+                None,
             )
             .await
             .unwrap();
@@ -571,6 +608,39 @@ mod tests {
         assert_eq!(
             sent,
             json!({"message": "prompt text", "session_id": "sess-1", "wait": 120})
+        );
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_muse_sends_image_field() {
+        let path = tmp_sock("ask-image");
+        let (handle, received) =
+            unix_server(&path, vec![b"{\"ok\": true, \"reply\": \"hi\"}\n".to_vec()]);
+        let gadget = UnixGadget {
+            socket_path: path.to_string_lossy().to_string(),
+            timeout: StdDuration::from_secs(5),
+        };
+        let image = ImageInput {
+            mime_type: "image/png".to_string(),
+            data_base64: "aGVsbG8=".to_string(),
+            filename: "image.png".to_string(),
+        };
+        gadget
+            .ask("look".to_string(), None, None, Some(image))
+            .await
+            .unwrap();
+        let sent: Value = serde_json::from_slice(&received.lock().unwrap()).unwrap();
+        assert_eq!(
+            sent,
+            json!({
+                "message": "look",
+                "image": {
+                    "mime_type": "image/png",
+                    "data_base64": "aGVsbG8=",
+                    "filename": "image.png",
+                },
+            })
         );
         handle.join().unwrap();
     }
@@ -588,7 +658,7 @@ mod tests {
         };
         assert_eq!(
             gadget
-                .ask("prompt text".to_string(), None, None)
+                .ask("prompt text".to_string(), None, None, None)
                 .await
                 .unwrap(),
             json!({"ok": true, "response": "hi"})
@@ -608,7 +678,7 @@ mod tests {
             timeout: StdDuration::from_secs(5),
         };
         gadget
-            .ask("prompt text".to_string(), None, Some(120))
+            .ask("prompt text".to_string(), None, Some(120), None)
             .await
             .unwrap();
         let sent: Value = serde_json::from_slice(&received.lock().unwrap()).unwrap();
@@ -644,7 +714,7 @@ mod tests {
             socket_path: path.to_string_lossy().to_string(),
             timeout: StdDuration::from_secs(5),
         };
-        let mut rx = gadget.stream("p", Some("s"));
+        let mut rx = gadget.stream("p", Some("s"), None);
         let mut kinds = Vec::new();
         let mut items = Vec::new();
         while let Some(item) = rx.recv().await {
@@ -681,7 +751,7 @@ mod tests {
             socket_path: path.to_string_lossy().to_string(),
             timeout: StdDuration::from_secs(5),
         };
-        let mut rx = gadget.stream("p", Some("s"));
+        let mut rx = gadget.stream("p", Some("s"), None);
         let mut kinds = Vec::new();
         while let Some(item) = rx.recv().await {
             match item {
@@ -702,7 +772,7 @@ mod tests {
             socket_path: path.to_string_lossy().to_string(),
             timeout: StdDuration::from_secs(5),
         };
-        let mut rx = gadget.stream("p", None);
+        let mut rx = gadget.stream("p", None, None);
         let mut items = Vec::new();
         while let Some(item) = rx.recv().await {
             items.push(item);
